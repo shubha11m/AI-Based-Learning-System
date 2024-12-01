@@ -1,0 +1,138 @@
+/* Admin Layout Styles */
+.admin-layout {
+    display: flex;
+  }
+  
+  .main-area {
+    margin-left: 220px; /* Sidebar width */
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+  }
+  
+  /* .header {
+    background-color: #34495e;
+    color: white;
+    padding: 10px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  } */
+  .header {
+    width: 100%; /* Full width */
+    position: fixed; /* Fixed at the top */
+    top: 0;
+    left: 0;
+    background-color: #34495e;
+    color: white;
+    padding: 10px 20px;
+    z-index: 2; /* Make sure the header is above the sidebar */
+    border-bottom: 2px solid #ddd;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  
+  .header-right {
+    display: flex;
+    align-items: center;
+  }
+  
+  .search-box {
+    padding: 5px 10px;
+    margin-right: 20px;
+    border: none;
+    border-radius: 5px;
+  }
+  
+  .header-icons span {
+    margin-left: 20px;
+    cursor: pointer;
+  }
+  
+  /* .sidebar {
+    width: 220px;
+    background-color: #2c3e50;
+    color: white;
+    padding: 20px;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+  } */
+  
+  .sidebar ul {
+    list-style-type: none;
+    padding: 0;
+  }
+  
+  .sidebar ul li {
+    margin: 20px 0;
+  }
+  
+  .sidebar ul li a {
+    color: white;
+    text-decoration: none;
+    font-size: 18px;
+    display: block;
+    PADDING-LEFT: 62px;
+  }
+  
+  /* .sidebar ul li a:hover {
+    background-color: #34495e;
+    padding: 10px;
+    border-radius: 5px;
+  } */
+  
+  .content {
+    padding: 20px;
+    overflow-y: auto;
+  }
+  
+  .footer {
+    background-color: #34495e;
+    color: white;
+    text-align: center;
+    padding: 10px;
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+  }
+  /* Admin Layout */
+.admin-layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  position: relative;
+}
+
+/* Sidebar styles */
+.sidebar {
+  width: 230px; /* Sidebar width */
+  background-color: #2c3e50;
+  color: white;
+  position: fixed; /* Sidebar fixed on the left */
+  top: 60px; /* Just below the header */
+  left: 0;
+  bottom: 0;
+  z-index: 1; /* Sidebar behind the header */
+  transition: all 0.3s ease-in-out;
+  padding-top: 20px;
+  height: calc(100vh - 60px); /* Full height minus the header height */
+}
+
+/* Sidebar links */
+.sidebar a {
+  display: block;
+  color: white;
+  padding: 15px;
+  text-decoration: none;
+}
+
+.sidebar a:hover {
+  background-color: #34495e;
+}
+
+.logo{
+  padding-left: 60px;
+}
+/* Header styles */

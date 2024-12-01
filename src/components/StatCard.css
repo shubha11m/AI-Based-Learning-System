@@ -1,0 +1,35 @@
+.stat-card {
+  padding: 20px;
+  background-color: #ecf0f1; /* Light background color for the stat cards */
+  color: #34495e; /* Dark text color for contrast */
+  text-align: center;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); /* Soft shadow for depth */
+}
+
+.stat-card .stat-value {
+  font-size: 2rem;
+  font-weight: bold;
+  margin-top: 10px;
+}
+
+.stat-card .stat-title {
+  font-size: 1.2rem;
+  color: #7f8c8d; /* Slightly lighter color for titles */
+}
+
+.stat-card .stat-description {
+  font-size: 0.9rem;
+  color: #95a5a6; /* Light grey description */
+  margin-top: 10px;
+}
+
+.stat-card:hover {
+  background-color: #dcdcdc; /* Darker shade on hover */
+}
+
+@media (max-width: 768px) {
+  .stat-card {
+    margin: 10px; /* Adds spacing between cards on small screens */
+  }
+}

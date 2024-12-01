@@ -1,0 +1,120 @@
+/* Header Styles */
+.header {
+  background-color: #34495e;
+  color: white;
+  padding: 10px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+}
+
+.search-box {
+  padding: 5px 10px;
+  margin-right: 20px;
+  border: none;
+  border-radius: 5px;
+}
+
+.header-icons span {
+  margin-left: 20px;
+  cursor: pointer;
+}
+.logo-placeholder {
+  width: 221px;
+  height: 40px;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: bold;
+  border-radius: 50%; /* Makes it circular */
+  margin-right: 10px;
+}
+.page-title{
+  padding: 60px;
+}
+/* Header Right Section */
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 15px; /* Adds spacing between elements */
+}
+
+.search-box {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 5px;
+  width: 250px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  outline: none;
+  transition: box-shadow 0.3s ease;
+}
+
+.search-box:focus {
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.header-icons {
+  display: flex;
+  align-items: center;
+  gap: 15px; /* Adds space between icons */
+}
+
+.header-icons .icon {
+  position: relative;
+  cursor: pointer;
+  font-size: 20px;
+  color: white;
+  transition: color 0.3s ease;
+}
+
+.header-icons .icon:hover {
+  color: #f1c40f; /* Highlight on hover */
+}
+
+.header-icons .badge {
+  position: absolute;
+  top: -5px;
+  right: -10px;
+  background-color: #e74c3c;
+  color: white;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 50%;
+}
+
+.user-profile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.user-profile .avatar {
+  width: 35px;
+  height: 35px;
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.3s ease;
+}
+
+.user-profile .avatar:hover {
+  transform: scale(1.1); /* Slight zoom effect on hover */
+}
+
+.user-profile .username {
+  font-size: 16px;
+  font-weight: 500;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+
