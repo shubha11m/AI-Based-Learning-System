@@ -1,0 +1,50 @@
+/* MainContent Styles */
+.content {
+    padding: 20px;
+    overflow-y: auto;
+  }
+  
+  .overview {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 30px;
+  }
+  
+  .ai-section {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  
+  .ai-section .recent-activity,
+  .ai-section .ai-metrics,
+  .ai-section .ai-control,
+  .ai-section .system-logs {
+    background-color: #ecf0f1;
+    padding: 20px;
+    border-radius: 10px;
+  }
+  
+  .ai-section .recent-activity,
+  .ai-section .ai-metrics {
+    grid-column: span 2;
+  }
+  
+  .ai-section .ai-control button {
+    margin-top: 20px;
+  }
+  
+  .system-logs {
+    background-color: #ecf0f1;
+    padding: 15px;
+    margin-top: 20px;
+    border-radius: 5px;
+  }
+  
+  .system-logs .log-item {
+    padding: 10px;
+    background-color: #bdc3c7;
+    margin-bottom: 10px;
+    border-radius: 5px;
+  }
+  
