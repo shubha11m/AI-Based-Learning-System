@@ -401,4 +401,228 @@ try:
         print(f"[STEP 8] Diagnosis rows: {diagnosis_df.count()}")
 
     except Exception as e:
-        raise Exception(f"[STEP 8] FAILED building diagnosis dataframe:
+        raise Exception(f"[STEP 8] FAILED building diagnosis dataframe: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 9 — BUILD CLAIM LINES DATAFRAME
+    # ─────────────────────────────────────────────────────────────────────────
+    print("[STEP 9] Building claim_lines dataframe...")
+    try:
+        lines_df = raw_df.select(
+            F.col("payerKey").cast("long").alias("payer_key"),
+            F.col("memberKey").cast("long").alias("member_key"),
+            F.col("claimKey").cast("long").alias("claim_key"),
+            F.col("load_year"),
+            F.col("load_month"),
+            F.explode("claimLinesList").alias("ln")
+        ).select(
+            "payer_key", "member_key", "claim_key", "load_year", "load_month",
+            F.coalesce(F.col("ln.claimLineKey"),
+                       F.col("ln.ClaimLineKey")).cast("long").alias("claim_line_key"),
+            F.coalesce(F.col("ln.claimLineNumber"),
+                       F.col("ln.ClaimLineNumber")).cast("string").alias("claim_line_number"),
+            F.coalesce(F.col("ln.procedureCode"),
+                       F.col("ln.ProcedureCode")).cast("string").alias("procedure_code"),
+            F.coalesce(F.col("ln.procedureCodeType"),
+                       F.col("ln.ProcedureCodeType")).cast("string").alias("procedure_code_type"),
+            F.coalesce(F.col("ln.billedAmount"),
+                       F.col("ln.BilledAmount")).cast("decimal(18,2)").alias("billed_amount"),
+            F.coalesce(F.col("ln.clientPaidAmount"),
+                       F.col("ln.ClientPaidAmount")).cast("decimal(18,2)").alias("client_paid_amount"),
+            F.coalesce(F.col("ln.memberPaid"),
+                       F.col("ln.MemberPaid")).cast("decimal(18,2)").alias("member_paid"),
+            F.coalesce(F.col("ln.allowedAmount"),
+                       F.col("ln.AllowedAmount")).cast("decimal(18,2)").alias("allowed_amount"),
+            F.coalesce(F.col("ln.coveredAmount"),
+                       F.col("ln.CoveredAmount")).cast("decimal(18,2)").alias("covered_amount"),
+            F.coalesce(F.col("ln.discountAmount"),
+                       F.col("ln.DiscountAmount")).cast("decimal(18,2)").alias("discount_amount"),
+            F.coalesce(F.col("ln.discountReason"),
+                       F.col("ln.DiscountReason")).cast("string").alias("discount_reason"),
+            F.coalesce(F.col("ln.excludedAmount"),
+                       F.col("ln.ExcludedAmount")).cast("decimal(18,2)").alias("excluded_amount"),
+            F.coalesce(F.col("ln.excludedReason"),
+                       F.col("ln.ExcludedReason")).cast("string").alias("excluded_reason"),
+            F.coalesce(F.col("ln.withholdAmount"),
+                       F.col("ln.WithholdAmount")).cast("decimal(18,2)").alias("withhold_amount"),
+            F.coalesce(F.col("ln.withholdReason"),
+                       F.col("ln.WithholdReason")).cast("string").alias("withhold_reason"),
+            F.coalesce(F.col("ln.providerPaidAmount"),
+                       F.col("ln.ProviderPaidAmount")).cast("decimal(18,2)").alias("provider_paid_amount"),
+            F.coalesce(F.col("ln.originalClientPaidAmount"),
+                       F.col("ln.OriginalClientPaidAmount")).cast("decimal(18,2)").alias("original_client_paid_amount"),
+            F.coalesce(F.col("ln.previousPaidAmount"),
+                       F.col("ln.PreviousPaidAmount")).cast("decimal(18,2)").alias("previous_paid_amount"),
+            normalize_date(F.coalesce(F.col("ln.dateofServiceFrom"),
+                           F.col("ln.DateofServiceFrom"))).alias("date_of_service_from"),
+            normalize_date(F.coalesce(F.col("ln.dateofServiceThru"),
+                           F.col("ln.DateofServiceThru"))).alias("date_of_service_thru"),
+            F.coalesce(F.col("ln.modifierCode01"),
+                       F.col("ln.ModifierCode01")).cast("string").alias("modifier_code_01"),
+            F.coalesce(F.col("ln.modifierCode02"),
+                       F.col("ln.ModifierCode02")).cast("string").alias("modifier_code_02"),
+            F.coalesce(F.col("ln.placeofService"),
+                       F.col("ln.PlaceofService")).cast("string").alias("place_of_service"),
+            F.coalesce(F.col("ln.revenueCode"),
+                       F.col("ln.RevenueCode")).cast("string").alias("revenue_code"),
+            F.coalesce(F.col("ln.serviceType"),
+                       F.col("ln.ServiceType")).cast("string").alias("service_type"),
+            F.coalesce(F.col("ln.quantity"),
+                       F.col("ln.Quantity")).cast("decimal(10,2)").alias("quantity"),
+            F.coalesce(F.col("ln.houseCode"),
+                       F.col("ln.HouseCode")).cast("string").alias("house_code"),
+            F.coalesce(F.col("ln.houseCodeDescription"),
+                       F.col("ln.HouseCodeDescription")).cast("string").alias("house_code_description"),
+            F.coalesce(F.col("ln.paymentType"),
+                       F.col("ln.PaymentType")).cast("string").alias("payment_type"),
+            F.coalesce(F.col("ln.paymentTypeID"),
+                       F.col("ln.PaymentTypeID")).cast("string").alias("payment_type_id"),
+            F.coalesce(F.col("ln.paymentComments"),
+                       F.col("ln.PaymentComments")).cast("string").alias("payment_comments"),
+            F.coalesce(F.col("ln.checkNumber"),
+                       F.col("ln.CheckNumber")).cast("string").alias("check_number"),
+            F.coalesce(F.col("ln.transactionCode"),
+                       F.col("ln.TransactionCode")).cast("string").alias("transaction_code"),
+            F.coalesce(F.col("ln.transactionDescription"),
+                       F.col("ln.TransactionDescription")).cast("string").alias("transaction_description"),
+            F.coalesce(F.col("ln.adjustmentFlag"),
+                       F.col("ln.AdjustmentFlag")).cast("string").alias("adjustment_flag"),
+            F.coalesce(F.col("ln.isPrimaryNDC"),
+                       F.col("ln.IsPrimaryNDC")).cast("string").alias("is_primary_ndc"),
+            F.coalesce(F.col("ln.insuredTermDate"),
+                       F.col("ln.InsuredTermDate")).cast("string").alias("insured_term_date"),
+            F.coalesce(F.col("ln.manipulationReason"),
+                       F.col("ln.ManipulationReason")).cast("string").alias("manipulation_reason"),
+            F.coalesce(F.col("ln.claimDetailStatus"),
+                       F.col("ln.ClaimDetailStatus")).cast("string").alias("claim_detail_status"),
+            F.coalesce(F.col("ln.clientDataFeedCode"),
+                       F.col("ln.ClientDataFeedCode")).cast("string").alias("client_data_feed_code"),
+            F.coalesce(F.col("ln.inboundBatchMasterKey"),
+                       F.col("ln.InboundBatchMasterKey")).cast("long").alias("inbound_batch_master_key"),
+            F.coalesce(F.col("ln.batchRunSequence"),
+                       F.col("ln.BatchRunSequence")).cast("int").alias("batch_run_sequence"),
+            F.coalesce(F.col("ln.stageClaimLineKey"),
+                       F.col("ln.StageClaimLineKey")).cast("long").alias("stage_claim_line_key"),
+            normalize_ts(F.coalesce(F.col("ln.updatedAt"),
+                         F.col("ln.UpdatedAt"))).alias("updated_at"),
+            normalize_ts(F.coalesce(F.col("ln.createdAt"),
+                         F.col("ln.CreatedAt"))).alias("created_at"),
+        )
+        print(f"[STEP 9] Claim lines rows: {lines_df.count()}")
+
+    except Exception as e:
+        raise Exception(f"[STEP 9] FAILED building lines dataframe: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 10 — MERGE INTO ICEBERG
+    # ─────────────────────────────────────────────────────────────────────────
+    print("[STEP 10] Merging into Iceberg tables...")
+
+    claims_df.createOrReplaceTempView("claims_stage")
+    diagnosis_df.createOrReplaceTempView("diagnosis_stage")
+    lines_df.createOrReplaceTempView("lines_stage")
+
+    try:
+        spark.sql(f"""
+            MERGE INTO glue_catalog.{DATABASE}.claims AS t
+            USING claims_stage AS s
+            ON  t.payer_key   = s.payer_key
+            AND t.load_year   = s.load_year
+            AND t.load_month  = s.load_month
+            AND t.member_key  = s.member_key
+            AND t.claim_key   = s.claim_key
+            WHEN MATCHED AND s.updated_at_epoch > t.updated_at_epoch
+                THEN UPDATE SET *
+            WHEN NOT MATCHED
+                THEN INSERT *
+        """)
+        print("[STEP 10] Claims MERGE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED claims MERGE: {e}")
+
+    try:
+        spark.sql(f"""
+            MERGE INTO glue_catalog.{DATABASE}.claim_diagnosis AS t
+            USING diagnosis_stage AS s
+            ON  t.payer_key       = s.payer_key
+            AND t.load_year       = s.load_year
+            AND t.load_month      = s.load_month
+            AND t.claim_key       = s.claim_key
+            AND t.diagnosis_order = s.diagnosis_order
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+        print("[STEP 10] Diagnosis MERGE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED diagnosis MERGE: {e}")
+
+    try:
+        spark.sql(f"""
+            MERGE INTO glue_catalog.{DATABASE}.claim_lines AS t
+            USING lines_stage AS s
+            ON  t.payer_key         = s.payer_key
+            AND t.load_year         = s.load_year
+            AND t.load_month        = s.load_month
+            AND t.claim_key         = s.claim_key
+            AND t.claim_line_number = s.claim_line_number
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+        print("[STEP 10] Claim Lines MERGE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED claim lines MERGE: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 11 — OPTIMIZE CURRENT MONTH
+    # ─────────────────────────────────────────────────────────────────────────
+    current_year  = datetime.utcnow().year
+    current_month = datetime.utcnow().month
+    print(f"[STEP 11] Optimizing {current_year}/{current_month}...")
+
+    for tbl in ["claims", "claim_diagnosis", "claim_lines"]:
+        try:
+            spark.sql(f"""
+                OPTIMIZE glue_catalog.{DATABASE}.{tbl}
+                WHERE load_year  = {current_year}
+                AND   load_month = {current_month}
+            """)
+            print(f"[STEP 11] OPTIMIZE done → {tbl} ✅")
+        except Exception as e:
+            # Non fatal — optimize failure should not fail the job
+            print(f"[STEP 11] Warning — OPTIMIZE failed for {tbl}: {e}")
+
+    job_status = "SUCCESS"
+    print("[INFO] All steps completed successfully ✅")
+
+except Exception as e:
+    job_status = "FAILED"
+    print(f"[ERROR] Job failed: {e}")
+    raise
+
+finally:
+    # ─────────────────────────────────────────────────────────────────────────
+    # FINALLY — always runs whether job succeeds OR fails
+    # Saves watermark + commits job
+    # ─────────────────────────────────────────────────────────────────────────
+    print(f"[FINALLY] Job status: {job_status}")
+    print(f"[FINALLY] Files processed : {len(changed_files)}")
+    print(f"[FINALLY] Records merged  : {filtered_count}")
+
+    save_watermark(
+        status          = job_status,
+        files_processed = len(changed_files),
+        records_merged  = filtered_count,
+        mode            = "FULL LOAD" if is_full_load else "INCREMENTAL"
+    )
+
+    print("=" * 60)
+    print(f"[DONE] Job finished")
+    print(f"       Status          : {job_status}")
+    print(f"       Mode            : {'FULL LOAD' if is_full_load else 'INCREMENTAL'}")
+    print(f"       Files processed : {len(changed_files)}")
+    print(f"       Records merged  : {filtered_count}")
+    print(f"       Payer (POC)     : 233")
+    print(f"       Run timestamp   : {current_run_ts}")
+    print("=" * 60)
+
+    job.commit()
