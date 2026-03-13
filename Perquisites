@@ -1,0 +1,351 @@
+Here are all the prerequisites you need to check before running the job:
+
+---
+
+## 1. IAM Role — `glue-UAT-role`
+
+Go to **IAM Console → Roles → glue-UAT-role** and make sure these policies are attached:
+
+### S3 Permissions
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:ListBucket",
+    "s3:ListBucketMultipartUploads",
+    "s3:GetBucketLocation"
+  ],
+  "Resource": [
+    "arn:aws:s3:::nontrauma-claims-prod",
+    "arn:aws:s3:::nontrauma-claims-prod/*"
+  ]
+},
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ListBucket",
+    "s3:ListBucketMultipartUploads",
+    "s3:AbortMultipartUpload",
+    "s3:GetBucketLocation"
+  ],
+  "Resource": [
+    "arn:aws:s3:::nontrauma-analytics-prod",
+    "arn:aws:s3:::nontrauma-analytics-prod/*"
+  ]
+}
+```
+
+### Glue Permissions
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "glue:GetDatabase",
+    "glue:GetDatabases",
+    "glue:CreateDatabase",
+    "glue:GetTable",
+    "glue:GetTables",
+    "glue:CreateTable",
+    "glue:UpdateTable",
+    "glue:DeleteTable",
+    "glue:GetPartition",
+    "glue:GetPartitions",
+    "glue:CreatePartition",
+    "glue:UpdatePartition",
+    "glue:BatchCreatePartition",
+    "glue:BatchDeletePartition"
+  ],
+  "Resource": "*"
+}
+```
+
+### CloudWatch Logs (for job logs)
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "logs:CreateLogGroup",
+    "logs:CreateLogStream",
+    "logs:PutLogEvents"
+  ],
+  "Resource": "arn:aws:logs:*:*:/aws-glue/*"
+}
+```
+
+---
+
+## 2. Glue Job Settings
+
+Go to **Glue Studio → Hello-job-DEV-WORKDAY-5 → Job details** and confirm:
+
+| Setting | Required Value | Your Current Value |
+|---|---|---|
+| Glue version | 4.0 | ✅ 4.0 |
+| Spark version | 3.3 | ✅ 3.3 |
+| Language | Python 3 | ✅ Python 3 |
+| Worker type | G.2X | ✅ G.2X |
+| IAM Role | glue-UAT-role | ✅ Set |
+| Job parameters | param1=DEV, param2=WORKDAY-5 | ✅ Set |
+
+### One Extra Setting to Add
+Go to **Job details → Advanced properties** and enable:
+```
+Job bookmark → Disable   ← we use our own watermark, not Glue bookmark
+```
+
+---
+
+## 3. Iceberg Libraries
+
+Glue 4.0 has Iceberg built in — but you need to add this in **Job details → Job parameters**:
+
+| Key | Value |
+|---|---|
+| `--datalake-formats` | `iceberg` |
+| `--conf` | `spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions` |
+
+Go to **Job details → Job parameters → Add new parameter** and add these two.
+
+---
+
+## 4. S3 Buckets
+
+Go to **S3 Console** and confirm both buckets exist and these folders are ready:
+
+```
+nontrauma-claims-prod/
+  payerkey=233/          ← confirm this exists with data
+    memberkey=XXXXX/
+      XXXXXXXX.json
+
+nontrauma-analytics-prod/
+  iceberg/               ← Glue will create this automatically
+  watermarks/            ← Glue will create this automatically
+  athena-results/        ← create this manually for Athena
+```
+
+Create `athena-results/` folder manually:
+```
+Go to S3 → nontrauma-analytics-prod → Create folder → athena-results
+```
+
+---
+
+## 5. Glue Catalog Database
+
+Go to **Athena Console → Query editor** and run:
+```sql
+CREATE DATABASE IF NOT EXISTS claims_db_dev;
+```
+
+This must exist **before** the Glue job runs because the MERGE statements reference it.
+
+---
+
+## 6. Iceberg Tables in Athena
+
+Run these **before** the job — the MERGE in the script requires the tables to already exist:
+
+```sql
+-- TABLE 1: Claims
+CREATE TABLE claims_db_dev.claims (
+    member_key                   BIGINT,
+    claim_key                    BIGINT,
+    employer_group_key           BIGINT,
+    inbound_batch_master_key     BIGINT,
+    batch_run_sequence           INT,
+    stage_claim_key              BIGINT,
+    claim_number                 STRING,
+    claim_status                 STRING,
+    claim_source                 STRING,
+    claim_type                   STRING,
+    claim_method                 STRING,
+    form_type                    STRING,
+    type_of_bill                 STRING,
+    client_data_feed_code        STRING,
+    source_system_id             STRING,
+    plan_type                    STRING,
+    union_type                   STRING,
+    hospital_account_number      STRING,
+    patient_discharge_status     STRING,
+    place_of_service             STRING,
+    prior_claim_reference        STRING,
+    manipulation_reason          STRING,
+    billing_provider_name        STRING,
+    billing_provider_tin         STRING,
+    billing_provider_npi         STRING,
+    billing_provider_id          STRING,
+    billing_provider_address1    STRING,
+    billing_provider_address2    STRING,
+    billing_provider_city        STRING,
+    billing_provider_state       STRING,
+    billing_provider_zip         STRING,
+    billing_provider_phone       STRING,
+    billing_provider_email       STRING,
+    billing_provider_contact_name  STRING,
+    billing_provider_contact_phone STRING,
+    treating_physician_name      STRING,
+    treating_provider_tin        STRING,
+    treating_provider_medicare   STRING,
+    referring_provider_tin       STRING,
+    admit_provider_tin           STRING,
+    physician_provider_tin       STRING,
+    provider_type                STRING,
+    provider_class               STRING,
+    reimbursement_method         STRING,
+    is_capitated_claim           STRING,
+    is_medicare                  STRING,
+    is_split_claim               STRING,
+    is_workers_comp              STRING,
+    is_participating_provider    STRING,
+    is_encounter                 STRING,
+    adjustment_indicator         STRING,
+    assignment_flag              STRING,
+    accident_flag                STRING,
+    include_encounter_as_paid    STRING,
+    total_billed_amount          DECIMAL(18,2),
+    total_client_paid_amount     DECIMAL(18,2),
+    total_member_paid_amount     DECIMAL(18,2),
+    check_number                 STRING,
+    interest_allowed             STRING,
+    interest_claim_key           BIGINT,
+    encounter_claim_key          BIGINT,
+    encounter_related            STRING,
+    encounter_unrelated          STRING,
+    encounter_claim_requested    STRING,
+    service_begin_date           DATE,
+    service_thru_date            DATE,
+    date_paid                    DATE,
+    claim_received_date          DATE,
+    claim_load_datetime          TIMESTAMP,
+    claim_transferred_datetime   TIMESTAMP,
+    created_at                   TIMESTAMP,
+    updated_at                   TIMESTAMP,
+    updated_at_epoch             BIGINT,
+    legacy_source                STRING,
+    legacy_schema                STRING,
+    legacy_id                    STRING,
+    tracking_info                STRING
+)
+PARTITIONED BY (payer_key BIGINT, load_year INT, load_month INT)
+LOCATION 's3://nontrauma-analytics-prod/iceberg/claims/'
+TBLPROPERTIES (
+    'table_type'        = 'ICEBERG',
+    'format'            = 'parquet',
+    'write_compression' = 'snappy'
+);
+
+-- TABLE 2: Claim Diagnosis
+CREATE TABLE claims_db_dev.claim_diagnosis (
+    member_key               BIGINT,
+    claim_key                BIGINT,
+    diagnosis_code           STRING,
+    diagnosis_order          INT,
+    is_primary               STRING,
+    is_sensitive             INT,
+    is_trauma                INT,
+    version_indicator        INT,
+    client_data_feed_code    STRING,
+    inbound_batch_master_key BIGINT,
+    batch_run_sequence       INT,
+    claim_diagnosis_key      BIGINT
+)
+PARTITIONED BY (payer_key BIGINT, load_year INT, load_month INT)
+LOCATION 's3://nontrauma-analytics-prod/iceberg/claim_diagnosis/'
+TBLPROPERTIES (
+    'table_type'        = 'ICEBERG',
+    'format'            = 'parquet',
+    'write_compression' = 'snappy'
+);
+
+-- TABLE 3: Claim Lines
+CREATE TABLE claims_db_dev.claim_lines (
+    member_key                  BIGINT,
+    claim_key                   BIGINT,
+    claim_line_key              BIGINT,
+    claim_line_number           STRING,
+    procedure_code              STRING,
+    procedure_code_type         STRING,
+    billed_amount               DECIMAL(18,2),
+    client_paid_amount          DECIMAL(18,2),
+    member_paid                 DECIMAL(18,2),
+    allowed_amount              DECIMAL(18,2),
+    covered_amount              DECIMAL(18,2),
+    discount_amount             DECIMAL(18,2),
+    discount_reason             STRING,
+    excluded_amount             DECIMAL(18,2),
+    excluded_reason             STRING,
+    withhold_amount             DECIMAL(18,2),
+    withhold_reason             STRING,
+    provider_paid_amount        DECIMAL(18,2),
+    original_client_paid_amount DECIMAL(18,2),
+    previous_paid_amount        DECIMAL(18,2),
+    date_of_service_from        DATE,
+    date_of_service_thru        DATE,
+    modifier_code_01            STRING,
+    modifier_code_02            STRING,
+    place_of_service            STRING,
+    revenue_code                STRING,
+    service_type                STRING,
+    quantity                    DECIMAL(10,2),
+    house_code                  STRING,
+    house_code_description      STRING,
+    payment_type                STRING,
+    payment_type_id             STRING,
+    payment_comments            STRING,
+    check_number                STRING,
+    transaction_code            STRING,
+    transaction_description     STRING,
+    adjustment_flag             STRING,
+    is_primary_ndc              STRING,
+    insured_term_date           STRING,
+    manipulation_reason         STRING,
+    claim_detail_status         STRING,
+    client_data_feed_code       STRING,
+    inbound_batch_master_key    BIGINT,
+    batch_run_sequence          INT,
+    stage_claim_line_key        BIGINT,
+    updated_at                  TIMESTAMP,
+    created_at                  TIMESTAMP
+)
+PARTITIONED BY (payer_key BIGINT, load_year INT, load_month INT)
+LOCATION 's3://nontrauma-analytics-prod/iceberg/claim_lines/'
+TBLPROPERTIES (
+    'table_type'        = 'ICEBERG',
+    'format'            = 'parquet',
+    'write_compression' = 'snappy'
+);
+```
+
+---
+
+## 7. Athena Settings
+
+Go to **Athena Console → Settings → Manage** and set:
+```
+Query result location:
+s3://nontrauma-analytics-prod/athena-results/
+```
+
+---
+
+## Your Checklist Before Hitting Run
+
+```
+✅ 1. IAM role has S3 + Glue + CloudWatch permissions
+✅ 2. Glue job params → add --datalake-formats = iceberg
+✅ 3. Glue job bookmark → Disabled
+✅ 4. S3 → confirm payerkey=233 folder exists with JSON files
+✅ 5. S3 → create athena-results/ folder in nontrauma-analytics-prod
+✅ 6. Athena → run CREATE DATABASE claims_db_dev
+✅ 7. Athena → run all 3 CREATE TABLE statements
+✅ 8. Athena → set query result location
+✅ 9. Glue script → pasted and saved
+✅ 10. Hit RUN!
+```
+
+Complete all 10 steps in order and the job will run successfully!
