@@ -1,4 +1,4 @@
-Here is the complete script with try/catch/finally added throughout:
+Here is the complete full script:
 
 ```python
 import sys
@@ -6,7 +6,6 @@ import json
 import boto3
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
-from pyspark import SparkConf
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
@@ -18,28 +17,8 @@ args = getResolvedOptions(sys.argv, [
     'param2',
 ])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ICEBERG CONFIG — must be set BEFORE Spark starts
-# ═════════════════════════════════════════════════════════════════════════════
-conf = SparkConf()
-conf.set("spark.sql.extensions",
-    "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-conf.set("spark.sql.catalog.glue_catalog",
-    "org.apache.iceberg.aws.glue.GlueCatalog")
-conf.set("spark.sql.catalog.glue_catalog.warehouse",
-    "s3://nontrauma-analytics-prod/iceberg/")
-conf.set("spark.sql.catalog.glue_catalog.io-impl",
-    "org.apache.iceberg.aws.s3.S3FileIO")
-conf.set("spark.sql.catalog.glue_catalog.catalog-impl",
-    "org.apache.iceberg.aws.glue.GlueCatalog")
-conf.set("spark.sql.defaultCatalog",
-    "glue_catalog")
-conf.set("spark.sql.iceberg.handle-timestamp-without-timezone",
-    "true")
-conf.set("spark.sql.sources.partitionOverwriteMode",
-    "dynamic")
-
-sc          = SparkContext(conf=conf)
+# ── Let Glue handle ALL Iceberg config via --datalake-formats=iceberg ─────────
+sc          = SparkContext()
 glueContext = GlueContext(sc)
 spark       = glueContext.spark_session
 job         = Job(glueContext)
@@ -48,18 +27,24 @@ job.init(args['JOB_NAME'], args)
 ENV = args['param1']
 RUN = args['param2']
 
-SOURCE_BUCKET    = "nontrauma-claims-prod"
+SOURCE_BUCKET    = "nontrauma-claim-prod"
 TARGET_BUCKET    = "nontrauma-analytics-prod"
 SOURCE_BUCKET_S3 = f"s3://{SOURCE_BUCKET}"
 TARGET_BUCKET_S3 = f"s3://{TARGET_BUCKET}"
 DATABASE         = "claims_db_dev"
-WATERMARK_KEY    = "watermarks/claims_last_run.json"
+PAYER_KEY        = "233"    # TODO: later replace with args['param3']
+WATERMARK_KEY    = f"watermarks/claims_payer_{PAYER_KEY}_last_run.json"
 
 print(f"[INFO] ENV={ENV} | RUN={RUN}")
-print(f"[INFO] Source  → {SOURCE_BUCKET_S3}")
-print(f"[INFO] Target  → {TARGET_BUCKET_S3}")
-print(f"[INFO] DB      → {DATABASE}")
-print("[INFO] Iceberg config loaded via SparkConf ✅")
+print(f"[INFO] Source    → {SOURCE_BUCKET_S3}")
+print(f"[INFO] Target    → {TARGET_BUCKET_S3}")
+print(f"[INFO] DB        → {DATABASE}")
+print(f"[INFO] PAYER_KEY → {PAYER_KEY}")
+
+# ── Safe runtime configs only ─────────────────────────────────────────────────
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+print("[INFO] Spark runtime configs set ✅")
 
 # ── Tracking variables for finally block ─────────────────────────────────────
 changed_files  = []
@@ -68,9 +53,12 @@ is_full_load   = True
 job_status     = "STARTED"
 s3_client      = boto3.client("s3")
 
-# ═════════════════════════════════════════════════════════════════════════════
+current_run_epoch_ms = int(datetime.utcnow().timestamp() * 1000)
+current_run_ts       = datetime.utcnow().isoformat()
+
+# =============================================================================
 # HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 def normalize_ts(col_ref):
     return F.when(
         col_ref.cast("string").rlike("^\\d{13}$"),
@@ -91,7 +79,6 @@ def normalize_date(col_ref):
     ).otherwise(None)
 
 def save_watermark(status, files_processed, records_merged, mode):
-    """Always saves watermark regardless of success or failure"""
     try:
         s3_client.put_object(
             Bucket=TARGET_BUCKET,
@@ -103,6 +90,7 @@ def save_watermark(status, files_processed, records_merged, mode):
                 "records_merged":    records_merged,
                 "mode":              mode,
                 "job_status":        status,
+                "payer_key":         PAYER_KEY,
                 "env":               ENV,
                 "run":               RUN
             })
@@ -111,23 +99,19 @@ def save_watermark(status, files_processed, records_merged, mode):
     except Exception as wm_err:
         print(f"[WATERMARK] Failed to save watermark: {wm_err}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN JOB — wrapped in try/except/finally
-# ═════════════════════════════════════════════════════════════════════════════
-current_run_epoch_ms = int(datetime.utcnow().timestamp() * 1000)
-current_run_ts       = datetime.utcnow().isoformat()
-
+# =============================================================================
+# MAIN JOB
+# =============================================================================
 try:
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 1 — CREATE DATABASE
     # ─────────────────────────────────────────────────────────────────────────
     try:
-        spark.sql(f"CREATE DATABASE IF NOT EXISTS glue_catalog.{DATABASE}")
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
         print(f"[STEP 1] Database {DATABASE} ready ✅")
     except Exception as e:
-        print(f"[STEP 1] Warning — database creation: {e}")
-        # Non fatal — database may already exist
+        print(f"[STEP 1] DB warning (may already exist): {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 2 — READ WATERMARK
@@ -154,24 +138,40 @@ try:
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 3 — FIND CHANGED FILES
+    # Structure: s3://nontrauma-claim-prod/{payerkey}/{memberkey}/{claimkey}.json
     # ─────────────────────────────────────────────────────────────────────────
-    print("[STEP 3] Scanning S3 for changed files...")
+    print(f"[STEP 3] Scanning S3 for changed files — PAYER={PAYER_KEY}...")
     try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        pages     = paginator.paginate(Bucket=SOURCE_BUCKET, Prefix="payerkey=")
+        paginator      = s3_client.get_paginator("list_objects_v2")
+        pages          = paginator.paginate(
+            Bucket=SOURCE_BUCKET,
+            Prefix=f"{PAYER_KEY}/",
+            PaginationConfig={"PageSize": 1000}
+        )
+
+        changed_files  = []
+        total_scanned  = 0
+        members_found  = set()
 
         for page in pages:
             for obj in page.get("Contents", []):
                 key           = obj["Key"]
                 last_modified = obj["LastModified"]
                 file_epoch_ms = int(last_modified.timestamp() * 1000)
+                total_scanned += 1
+
                 if key.endswith(".json") and file_epoch_ms > last_run_epoch_ms:
                     changed_files.append(f"s3://{SOURCE_BUCKET}/{key}")
+                    parts = key.split("/")
+                    if len(parts) >= 2:
+                        members_found.add(parts[1])
 
-        print(f"[STEP 3] Changed files found: {len(changed_files)}")
+        print(f"[STEP 3] Total files scanned    : {total_scanned}")
+        print(f"[STEP 3] Changed files found    : {len(changed_files)}")
+        print(f"[STEP 3] Unique members affected: {len(members_found)}")
 
         if len(changed_files) > 0:
-            print("[STEP 3] Sample files:")
+            print("[STEP 3] Sample changed files:")
             for f in changed_files[:5]:
                 print(f"         {f}")
             if len(changed_files) > 5:
@@ -182,8 +182,7 @@ try:
 
     if len(changed_files) == 0:
         print("[STEP 3] No new or modified files — nothing to do!")
-        save_watermark("SUCCESS - NO CHANGES", 0, 0,
-                       "INCREMENTAL - NO CHANGES")
+        save_watermark("SUCCESS - NO CHANGES", 0, 0, "INCREMENTAL - NO CHANGES")
         job.commit()
         sys.exit(0)
 
@@ -192,20 +191,28 @@ try:
     # ─────────────────────────────────────────────────────────────────────────
     print("[STEP 4] Reading changed JSON files...")
     try:
-        raw_df = spark.read \
+        raw_df    = spark.read \
             .option("multiline", "false") \
             .option("mode", "PERMISSIVE") \
             .json(changed_files)
 
-        # POC FILTER — remove this line for full load
-        raw_df    = raw_df.filter(F.col("payerKey") == 233)
         raw_count = raw_df.count()
         print(f"[STEP 4] Records loaded: {raw_count}")
 
+        print("[STEP 4] Records per payer:")
+        raw_df.groupBy("payerKey") \
+              .agg(
+                  F.count("*").alias("record_count"),
+                  F.countDistinct("memberKey").alias("member_count"),
+                  F.countDistinct("claimKey").alias("claim_count")
+              ) \
+              .orderBy("payerKey") \
+              .show(50, truncate=False)
+
         if raw_count == 0:
-            print("[STEP 4] No records after payer filter — exiting")
+            print("[STEP 4] No records loaded — exiting")
             save_watermark("SUCCESS - NO RECORDS", len(changed_files), 0,
-                           "INCREMENTAL - NO RECORDS FOR PAYER")
+                           "NO RECORDS")
             job.commit()
             sys.exit(0)
 
@@ -213,7 +220,7 @@ try:
         raise Exception(f"[STEP 4] FAILED reading JSON files: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 5 — FILTER BY updatedAt
+    # STEP 5 — FILTER BY updatedAt > watermark
     # ─────────────────────────────────────────────────────────────────────────
     print("[STEP 5] Filtering records by updatedAt > last watermark...")
     try:
@@ -225,8 +232,10 @@ try:
             ).when(
                 F.col("updatedAt").cast("string").rlike("^\\d{4}-\\d{2}-\\d{2}"),
                 (F.unix_timestamp(
-                    F.to_timestamp(F.col("updatedAt").cast("string"),
-                                   "yyyy-MM-dd'T'HH:mm:ss.SSSXXX")
+                    F.to_timestamp(
+                        F.col("updatedAt").cast("string"),
+                        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+                    )
                 ) * 1000).cast("long")
             ).otherwise(F.lit(0).cast("long"))
         )
@@ -275,87 +284,94 @@ try:
     # ─────────────────────────────────────────────────────────────────────────
     print("[STEP 7] Building claims dataframe...")
     try:
+        def safe_col(col_name, cast_type="string"):
+            if col_name in raw_df.columns:
+                return F.col(col_name).cast(cast_type)
+            else:
+                print(f"[WARN] Column missing: {col_name} → null")
+                return F.lit(None).cast(cast_type)
+
         claims_df = raw_df.select(
             F.col("payerKey").cast("long").alias("payer_key"),
             F.col("load_year"),
             F.col("load_month"),
             F.col("memberKey").cast("long").alias("member_key"),
             F.col("claimKey").cast("long").alias("claim_key"),
-            F.col("employerGroupKey").cast("long").alias("employer_group_key"),
-            F.col("inboundBatchMasterKey").cast("long").alias("inbound_batch_master_key"),
-            F.col("batchRunSequence").cast("int").alias("batch_run_sequence"),
-            F.col("stageClaimKey").cast("long").alias("stage_claim_key"),
-            F.col("claimNumber").cast("string").alias("claim_number"),
-            F.col("claimStatus").cast("string").alias("claim_status"),
-            F.col("claimSource").cast("string").alias("claim_source"),
-            F.col("claimType").cast("string").alias("claim_type"),
-            F.col("claimMethod").cast("string").alias("claim_method"),
-            F.col("formType").cast("string").alias("form_type"),
-            F.col("typeofBill").cast("string").alias("type_of_bill"),
-            F.col("clientDataFeedCode").cast("string").alias("client_data_feed_code"),
-            F.col("sourceSystemID").cast("string").alias("source_system_id"),
-            F.col("planType").cast("string").alias("plan_type"),
-            F.col("unionType").cast("string").alias("union_type"),
-            F.col("hospitalAccountNumber").cast("string").alias("hospital_account_number"),
-            F.col("patientDischargeStatus").cast("string").alias("patient_discharge_status"),
-            F.col("placeofService").cast("string").alias("place_of_service"),
-            F.col("priorClaimReference").cast("string").alias("prior_claim_reference"),
-            F.col("manipulationReason").cast("string").alias("manipulation_reason"),
-            F.col("billingProviderName").cast("string").alias("billing_provider_name"),
-            F.col("billingProviderTIN").cast("string").alias("billing_provider_tin"),
-            F.col("billingProviderNPI").cast("string").alias("billing_provider_npi"),
-            F.col("billingProviderID").cast("string").alias("billing_provider_id"),
-            F.col("billingProviderAddress1").cast("string").alias("billing_provider_address1"),
-            F.col("billingProviderAddress2").cast("string").alias("billing_provider_address2"),
-            F.col("billingProviderCity").cast("string").alias("billing_provider_city"),
-            F.col("billingProviderState").cast("string").alias("billing_provider_state"),
-            F.col("billingProviderZip").cast("string").alias("billing_provider_zip"),
-            F.col("billingProviderPhone").cast("string").alias("billing_provider_phone"),
-            F.col("billingProviderEmail").cast("string").alias("billing_provider_email"),
-            F.col("billingProviderContactName").cast("string").alias("billing_provider_contact_name"),
-            F.col("billingProviderContactPhone").cast("string").alias("billing_provider_contact_phone"),
-            F.col("treatingPhysicianName").cast("string").alias("treating_physician_name"),
-            F.col("treatingProviderTIN").cast("string").alias("treating_provider_tin"),
-            F.col("treatingProviderMedicare").cast("string").alias("treating_provider_medicare"),
-            F.col("referringProviderTIN").cast("string").alias("referring_provider_tin"),
-            F.col("admitProviderTIN").cast("string").alias("admit_provider_tin"),
-            F.col("physicianProviderTIN").cast("string").alias("physician_provider_tin"),
-            F.col("providerType").cast("string").alias("provider_type"),
-            F.col("providerClass").cast("string").alias("provider_class"),
-            F.col("reimbursementMethod").cast("string").alias("reimbursement_method"),
-            F.col("isCapitatedClaim").cast("string").alias("is_capitated_claim"),
-            F.col("isMedicare").cast("string").alias("is_medicare"),
-            F.col("isSplitClaim").cast("string").alias("is_split_claim"),
-            F.col("isWorkersComp").cast("string").alias("is_workers_comp"),
-            F.col("isParticipatingProvider").cast("string").alias("is_participating_provider"),
-            F.col("isEncounter").cast("string").alias("is_encounter"),
-            F.col("adjustmentIndicator").cast("string").alias("adjustment_indicator"),
-            F.col("assignmentFlag").cast("string").alias("assignment_flag"),
-            F.col("accidentFlag").cast("string").alias("accident_flag"),
-            F.col("includeEncounterAsPaid").cast("string").alias("include_encounter_as_paid"),
-            F.col("totalBilledAmount").cast("decimal(18,2)").alias("total_billed_amount"),
-            F.col("totalClientPaidAmount").cast("decimal(18,2)").alias("total_client_paid_amount"),
-            F.col("totalMemberPaidAmount").cast("decimal(18,2)").alias("total_member_paid_amount"),
-            F.col("checkNumber").cast("string").alias("check_number"),
-            F.col("interestAllowed").cast("string").alias("interest_allowed"),
-            F.col("interestClaimKey").cast("long").alias("interest_claim_key"),
-            F.col("encounterClaimKey").cast("long").alias("encounter_claim_key"),
-            F.col("encounterRelated").cast("string").alias("encounter_related"),
-            F.col("encounterUnrelated").cast("string").alias("encounter_unrelated"),
-            F.col("encounterClaimRequested").cast("string").alias("encounter_claim_requested"),
+            safe_col("employerGroupKey", "long").alias("employer_group_key"),
+            safe_col("inboundBatchMasterKey", "long").alias("inbound_batch_master_key"),
+            safe_col("batchRunSequence", "int").alias("batch_run_sequence"),
+            safe_col("stageClaimKey", "long").alias("stage_claim_key"),
+            safe_col("claimNumber").alias("claim_number"),
+            safe_col("claimStatus").alias("claim_status"),
+            safe_col("claimSource").alias("claim_source"),
+            safe_col("claimType").alias("claim_type"),
+            safe_col("claimMethod").alias("claim_method"),
+            safe_col("formType").alias("form_type"),
+            safe_col("typeofBill").alias("type_of_bill"),
+            safe_col("clientDataFeedCode").alias("client_data_feed_code"),
+            safe_col("sourceSystemID").alias("source_system_id"),
+            safe_col("planType").alias("plan_type"),
+            safe_col("unionType").alias("union_type"),
+            safe_col("hospitalAccountNumber").alias("hospital_account_number"),
+            safe_col("patientDischargeStatus").alias("patient_discharge_status"),
+            safe_col("placeofService").alias("place_of_service"),
+            safe_col("priorClaimReference").alias("prior_claim_reference"),
+            safe_col("manipulationReason").alias("manipulation_reason"),
+            safe_col("billingProviderName").alias("billing_provider_name"),
+            safe_col("billingProviderTIN").alias("billing_provider_tin"),
+            safe_col("billingProviderNPI").alias("billing_provider_npi"),
+            safe_col("billingProviderID").alias("billing_provider_id"),
+            safe_col("billingProviderAddress1").alias("billing_provider_address1"),
+            safe_col("billingProviderAddress2").alias("billing_provider_address2"),
+            safe_col("billingProviderCity").alias("billing_provider_city"),
+            safe_col("billingProviderState").alias("billing_provider_state"),
+            safe_col("billingProviderZip").alias("billing_provider_zip"),
+            safe_col("billingProviderPhone").alias("billing_provider_phone"),
+            safe_col("billingProviderEmail").alias("billing_provider_email"),
+            safe_col("billingProviderContactName").alias("billing_provider_contact_name"),
+            safe_col("billingProviderContactPhone").alias("billing_provider_contact_phone"),
+            safe_col("treatingPhysicianName").alias("treating_physician_name"),
+            safe_col("treatingProviderTIN").alias("treating_provider_tin"),
+            safe_col("treatingProviderMedicare").alias("treating_provider_medicare"),
+            safe_col("referringProviderTIN").alias("referring_provider_tin"),
+            safe_col("admitProviderTIN").alias("admit_provider_tin"),
+            safe_col("physicianProviderTIN").alias("physician_provider_tin"),
+            safe_col("providerType").alias("provider_type"),
+            safe_col("providerClass").alias("provider_class"),
+            safe_col("reimbursementMethod").alias("reimbursement_method"),
+            safe_col("isCapitatedClaim").alias("is_capitated_claim"),
+            safe_col("isMedicare").alias("is_medicare"),
+            safe_col("isSplitClaim").alias("is_split_claim"),
+            safe_col("isWorkersComp").alias("is_workers_comp"),
+            safe_col("isParticipatingProvider").alias("is_participating_provider"),
+            safe_col("isEncounter").alias("is_encounter"),
+            safe_col("adjustmentIndicator").alias("adjustment_indicator"),
+            safe_col("assignmentFlag").alias("assignment_flag"),
+            safe_col("accidentFlag").alias("accident_flag"),
+            safe_col("includeEncounterAsPaid").alias("include_encounter_as_paid"),
+            safe_col("totalBilledAmount", "decimal(18,2)").alias("total_billed_amount"),
+            safe_col("totalClientPaidAmount", "decimal(18,2)").alias("total_client_paid_amount"),
+            safe_col("totalMemberPaidAmount", "decimal(18,2)").alias("total_member_paid_amount"),
+            safe_col("checkNumber").alias("check_number"),
+            safe_col("interestAllowed").alias("interest_allowed"),
+            safe_col("interestClaimKey", "long").alias("interest_claim_key"),
+            safe_col("encounterClaimKey", "long").alias("encounter_claim_key"),
+            safe_col("encounterRelated").alias("encounter_related"),
+            safe_col("encounterUnrelated").alias("encounter_unrelated"),
+            safe_col("encounterClaimRequested").alias("encounter_claim_requested"),
             normalize_date(F.col("serviceBeginDate")).alias("service_begin_date"),
             normalize_date(F.col("serviceThruDate")).alias("service_thru_date"),
             normalize_date(F.col("datePaid")).alias("date_paid"),
             normalize_date(F.col("claimReceivedDate")).alias("claim_received_date"),
             F.col("claim_load_ts").alias("claim_load_datetime"),
-            normalize_ts(F.col("claimTransferredDateTime")).alias("claim_transferred_datetime"),
+            normalize_ts(safe_col("claimTransferredDateTime")).alias("claim_transferred_datetime"),
             normalize_ts(F.col("createdAt")).alias("created_at"),
             normalize_ts(F.col("updatedAt")).alias("updated_at"),
             F.col("updatedAt").cast("long").alias("updated_at_epoch"),
-            F.col("legacySource").cast("string").alias("legacy_source"),
-            F.col("legacySchema").cast("string").alias("legacy_schema"),
-            F.col("legacyID").cast("string").alias("legacy_id"),
-            F.col("trackingInfo").cast("string").alias("tracking_info"),
+            safe_col("legacySource").alias("legacy_source"),
+            safe_col("legacySchema").alias("legacy_schema"),
+            safe_col("legacyID").alias("legacy_id"),
+            safe_col("trackingInfo").alias("tracking_info"),
         ).dropDuplicates(["payer_key", "member_key", "claim_key"])
 
         print(f"[STEP 7] Claims rows: {claims_df.count()}")
@@ -374,29 +390,54 @@ try:
             F.col("claimKey").cast("long").alias("claim_key"),
             F.col("load_year"),
             F.col("load_month"),
-            F.explode("claimDiagnosisList").alias("dx")
+            F.explode(
+                F.when(
+                    F.col("claimDiagnosisList").isNotNull(),
+                    F.col("claimDiagnosisList")
+                ).otherwise(F.array())
+            ).alias("dx")
         ).select(
             "payer_key", "member_key", "claim_key", "load_year", "load_month",
             F.coalesce(F.col("dx.diagnosisCode"),
-                       F.col("dx.DiagnosisCode")).cast("string").alias("diagnosis_code"),
+                       F.col("dx.DiagnosisCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("diagnosis_code"),
             F.coalesce(F.col("dx.diagnosisOrder"),
-                       F.col("dx.DiagnosisOrder")).cast("int").alias("diagnosis_order"),
+                       F.col("dx.DiagnosisOrder"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("diagnosis_order"),
             F.coalesce(F.col("dx.isPrimary"),
-                       F.col("dx.IsPrimary")).cast("string").alias("is_primary"),
+                       F.col("dx.IsPrimary"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("is_primary"),
             F.coalesce(F.col("dx.isSensitive"),
-                       F.col("dx.IsSensitive")).cast("int").alias("is_sensitive"),
+                       F.col("dx.IsSensitive"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("is_sensitive"),
             F.coalesce(F.col("dx.isTrauma"),
-                       F.col("dx.IsTrauma")).cast("int").alias("is_trauma"),
+                       F.col("dx.IsTrauma"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("is_trauma"),
             F.coalesce(F.col("dx.versionIndicator"),
-                       F.col("dx.VersionIndicator")).cast("int").alias("version_indicator"),
+                       F.col("dx.VersionIndicator"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("version_indicator"),
             F.coalesce(F.col("dx.clientDataFeedCode"),
-                       F.col("dx.ClientDataFeedCode")).cast("string").alias("client_data_feed_code"),
+                       F.col("dx.ClientDataFeedCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("client_data_feed_code"),
             F.coalesce(F.col("dx.inboundBatchMasterKey"),
-                       F.col("dx.InboundBatchMasterKey")).cast("long").alias("inbound_batch_master_key"),
+                       F.col("dx.InboundBatchMasterKey"),
+                       F.lit(None).cast("long")
+                       ).cast("long").alias("inbound_batch_master_key"),
             F.coalesce(F.col("dx.batchRunSequence"),
-                       F.col("dx.BatchRunSequence")).cast("int").alias("batch_run_sequence"),
+                       F.col("dx.BatchRunSequence"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("batch_run_sequence"),
             F.coalesce(F.col("dx.claimDiagnosisKey"),
-                       F.col("dx.ClaimDiagnosisKey")).cast("long").alias("claim_diagnosis_key"),
+                       F.col("dx.ClaimDiagnosisKey"),
+                       F.lit(None).cast("long")
+                       ).cast("long").alias("claim_diagnosis_key"),
         )
         print(f"[STEP 8] Diagnosis rows: {diagnosis_df.count()}")
 
@@ -414,99 +455,198 @@ try:
             F.col("claimKey").cast("long").alias("claim_key"),
             F.col("load_year"),
             F.col("load_month"),
-            F.explode("claimLinesList").alias("ln")
+            F.explode(
+                F.when(
+                    F.col("claimLinesList").isNotNull(),
+                    F.col("claimLinesList")
+                ).otherwise(F.array())
+            ).alias("ln")
         ).select(
             "payer_key", "member_key", "claim_key", "load_year", "load_month",
             F.coalesce(F.col("ln.claimLineKey"),
-                       F.col("ln.ClaimLineKey")).cast("long").alias("claim_line_key"),
+                       F.col("ln.ClaimLineKey"),
+                       F.lit(None).cast("long")
+                       ).cast("long").alias("claim_line_key"),
             F.coalesce(F.col("ln.claimLineNumber"),
-                       F.col("ln.ClaimLineNumber")).cast("string").alias("claim_line_number"),
+                       F.col("ln.ClaimLineNumber"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("claim_line_number"),
             F.coalesce(F.col("ln.procedureCode"),
-                       F.col("ln.ProcedureCode")).cast("string").alias("procedure_code"),
+                       F.col("ln.ProcedureCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("procedure_code"),
             F.coalesce(F.col("ln.procedureCodeType"),
-                       F.col("ln.ProcedureCodeType")).cast("string").alias("procedure_code_type"),
+                       F.col("ln.ProcedureCodeType"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("procedure_code_type"),
             F.coalesce(F.col("ln.billedAmount"),
-                       F.col("ln.BilledAmount")).cast("decimal(18,2)").alias("billed_amount"),
+                       F.col("ln.BilledAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("billed_amount"),
             F.coalesce(F.col("ln.clientPaidAmount"),
-                       F.col("ln.ClientPaidAmount")).cast("decimal(18,2)").alias("client_paid_amount"),
+                       F.col("ln.ClientPaidAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("client_paid_amount"),
             F.coalesce(F.col("ln.memberPaid"),
-                       F.col("ln.MemberPaid")).cast("decimal(18,2)").alias("member_paid"),
+                       F.col("ln.MemberPaid"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("member_paid"),
             F.coalesce(F.col("ln.allowedAmount"),
-                       F.col("ln.AllowedAmount")).cast("decimal(18,2)").alias("allowed_amount"),
+                       F.col("ln.AllowedAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("allowed_amount"),
             F.coalesce(F.col("ln.coveredAmount"),
-                       F.col("ln.CoveredAmount")).cast("decimal(18,2)").alias("covered_amount"),
+                       F.col("ln.CoveredAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("covered_amount"),
             F.coalesce(F.col("ln.discountAmount"),
-                       F.col("ln.DiscountAmount")).cast("decimal(18,2)").alias("discount_amount"),
+                       F.col("ln.DiscountAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("discount_amount"),
             F.coalesce(F.col("ln.discountReason"),
-                       F.col("ln.DiscountReason")).cast("string").alias("discount_reason"),
+                       F.col("ln.DiscountReason"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("discount_reason"),
             F.coalesce(F.col("ln.excludedAmount"),
-                       F.col("ln.ExcludedAmount")).cast("decimal(18,2)").alias("excluded_amount"),
+                       F.col("ln.ExcludedAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("excluded_amount"),
             F.coalesce(F.col("ln.excludedReason"),
-                       F.col("ln.ExcludedReason")).cast("string").alias("excluded_reason"),
+                       F.col("ln.ExcludedReason"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("excluded_reason"),
             F.coalesce(F.col("ln.withholdAmount"),
-                       F.col("ln.WithholdAmount")).cast("decimal(18,2)").alias("withhold_amount"),
+                       F.col("ln.WithholdAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("withhold_amount"),
             F.coalesce(F.col("ln.withholdReason"),
-                       F.col("ln.WithholdReason")).cast("string").alias("withhold_reason"),
+                       F.col("ln.WithholdReason"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("withhold_reason"),
             F.coalesce(F.col("ln.providerPaidAmount"),
-                       F.col("ln.ProviderPaidAmount")).cast("decimal(18,2)").alias("provider_paid_amount"),
+                       F.col("ln.ProviderPaidAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("provider_paid_amount"),
             F.coalesce(F.col("ln.originalClientPaidAmount"),
-                       F.col("ln.OriginalClientPaidAmount")).cast("decimal(18,2)").alias("original_client_paid_amount"),
+                       F.col("ln.OriginalClientPaidAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("original_client_paid_amount"),
             F.coalesce(F.col("ln.previousPaidAmount"),
-                       F.col("ln.PreviousPaidAmount")).cast("decimal(18,2)").alias("previous_paid_amount"),
-            normalize_date(F.coalesce(F.col("ln.dateofServiceFrom"),
-                           F.col("ln.DateofServiceFrom"))).alias("date_of_service_from"),
-            normalize_date(F.coalesce(F.col("ln.dateofServiceThru"),
-                           F.col("ln.DateofServiceThru"))).alias("date_of_service_thru"),
+                       F.col("ln.PreviousPaidAmount"),
+                       F.lit(None).cast("decimal(18,2)")
+                       ).cast("decimal(18,2)").alias("previous_paid_amount"),
+            normalize_date(
+                F.coalesce(F.col("ln.dateofServiceFrom"),
+                           F.col("ln.DateofServiceFrom"),
+                           F.lit(None))
+            ).alias("date_of_service_from"),
+            normalize_date(
+                F.coalesce(F.col("ln.dateofServiceThru"),
+                           F.col("ln.DateofServiceThru"),
+                           F.lit(None))
+            ).alias("date_of_service_thru"),
             F.coalesce(F.col("ln.modifierCode01"),
-                       F.col("ln.ModifierCode01")).cast("string").alias("modifier_code_01"),
+                       F.col("ln.ModifierCode01"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("modifier_code_01"),
             F.coalesce(F.col("ln.modifierCode02"),
-                       F.col("ln.ModifierCode02")).cast("string").alias("modifier_code_02"),
+                       F.col("ln.ModifierCode02"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("modifier_code_02"),
             F.coalesce(F.col("ln.placeofService"),
-                       F.col("ln.PlaceofService")).cast("string").alias("place_of_service"),
+                       F.col("ln.PlaceofService"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("place_of_service"),
             F.coalesce(F.col("ln.revenueCode"),
-                       F.col("ln.RevenueCode")).cast("string").alias("revenue_code"),
+                       F.col("ln.RevenueCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("revenue_code"),
             F.coalesce(F.col("ln.serviceType"),
-                       F.col("ln.ServiceType")).cast("string").alias("service_type"),
+                       F.col("ln.ServiceType"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("service_type"),
             F.coalesce(F.col("ln.quantity"),
-                       F.col("ln.Quantity")).cast("decimal(10,2)").alias("quantity"),
+                       F.col("ln.Quantity"),
+                       F.lit(None).cast("decimal(10,2)")
+                       ).cast("decimal(10,2)").alias("quantity"),
             F.coalesce(F.col("ln.houseCode"),
-                       F.col("ln.HouseCode")).cast("string").alias("house_code"),
+                       F.col("ln.HouseCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("house_code"),
             F.coalesce(F.col("ln.houseCodeDescription"),
-                       F.col("ln.HouseCodeDescription")).cast("string").alias("house_code_description"),
+                       F.col("ln.HouseCodeDescription"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("house_code_description"),
             F.coalesce(F.col("ln.paymentType"),
-                       F.col("ln.PaymentType")).cast("string").alias("payment_type"),
+                       F.col("ln.PaymentType"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("payment_type"),
             F.coalesce(F.col("ln.paymentTypeID"),
-                       F.col("ln.PaymentTypeID")).cast("string").alias("payment_type_id"),
+                       F.col("ln.PaymentTypeID"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("payment_type_id"),
             F.coalesce(F.col("ln.paymentComments"),
-                       F.col("ln.PaymentComments")).cast("string").alias("payment_comments"),
+                       F.col("ln.PaymentComments"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("payment_comments"),
             F.coalesce(F.col("ln.checkNumber"),
-                       F.col("ln.CheckNumber")).cast("string").alias("check_number"),
+                       F.col("ln.CheckNumber"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("check_number"),
             F.coalesce(F.col("ln.transactionCode"),
-                       F.col("ln.TransactionCode")).cast("string").alias("transaction_code"),
+                       F.col("ln.TransactionCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("transaction_code"),
             F.coalesce(F.col("ln.transactionDescription"),
-                       F.col("ln.TransactionDescription")).cast("string").alias("transaction_description"),
+                       F.col("ln.TransactionDescription"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("transaction_description"),
             F.coalesce(F.col("ln.adjustmentFlag"),
-                       F.col("ln.AdjustmentFlag")).cast("string").alias("adjustment_flag"),
+                       F.col("ln.AdjustmentFlag"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("adjustment_flag"),
             F.coalesce(F.col("ln.isPrimaryNDC"),
-                       F.col("ln.IsPrimaryNDC")).cast("string").alias("is_primary_ndc"),
+                       F.col("ln.IsPrimaryNDC"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("is_primary_ndc"),
             F.coalesce(F.col("ln.insuredTermDate"),
-                       F.col("ln.InsuredTermDate")).cast("string").alias("insured_term_date"),
+                       F.col("ln.InsuredTermDate"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("insured_term_date"),
             F.coalesce(F.col("ln.manipulationReason"),
-                       F.col("ln.ManipulationReason")).cast("string").alias("manipulation_reason"),
+                       F.col("ln.ManipulationReason"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("manipulation_reason"),
             F.coalesce(F.col("ln.claimDetailStatus"),
-                       F.col("ln.ClaimDetailStatus")).cast("string").alias("claim_detail_status"),
+                       F.col("ln.ClaimDetailStatus"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("claim_detail_status"),
             F.coalesce(F.col("ln.clientDataFeedCode"),
-                       F.col("ln.ClientDataFeedCode")).cast("string").alias("client_data_feed_code"),
+                       F.col("ln.ClientDataFeedCode"),
+                       F.lit(None).cast("string")
+                       ).cast("string").alias("client_data_feed_code"),
             F.coalesce(F.col("ln.inboundBatchMasterKey"),
-                       F.col("ln.InboundBatchMasterKey")).cast("long").alias("inbound_batch_master_key"),
+                       F.col("ln.InboundBatchMasterKey"),
+                       F.lit(None).cast("long")
+                       ).cast("long").alias("inbound_batch_master_key"),
             F.coalesce(F.col("ln.batchRunSequence"),
-                       F.col("ln.BatchRunSequence")).cast("int").alias("batch_run_sequence"),
+                       F.col("ln.BatchRunSequence"),
+                       F.lit(None).cast("int")
+                       ).cast("int").alias("batch_run_sequence"),
             F.coalesce(F.col("ln.stageClaimLineKey"),
-                       F.col("ln.StageClaimLineKey")).cast("long").alias("stage_claim_line_key"),
-            normalize_ts(F.coalesce(F.col("ln.updatedAt"),
-                         F.col("ln.UpdatedAt"))).alias("updated_at"),
-            normalize_ts(F.coalesce(F.col("ln.createdAt"),
-                         F.col("ln.CreatedAt"))).alias("created_at"),
+                       F.col("ln.StageClaimLineKey"),
+                       F.lit(None).cast("long")
+                       ).cast("long").alias("stage_claim_line_key"),
+            normalize_ts(
+                F.coalesce(F.col("ln.updatedAt"),
+                           F.col("ln.UpdatedAt"),
+                           F.lit(None))
+            ).alias("updated_at"),
+            normalize_ts(
+                F.coalesce(F.col("ln.createdAt"),
+                           F.col("ln.CreatedAt"),
+                           F.lit(None))
+            ).alias("created_at"),
         )
         print(f"[STEP 9] Claim lines rows: {lines_df.count()}")
 
@@ -573,11 +713,11 @@ try:
         raise Exception(f"[STEP 10] FAILED claim lines MERGE: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 11 — OPTIMIZE CURRENT MONTH
+    # STEP 11 — OPTIMIZE CURRENT MONTH PARTITION
     # ─────────────────────────────────────────────────────────────────────────
     current_year  = datetime.utcnow().year
     current_month = datetime.utcnow().month
-    print(f"[STEP 11] Optimizing {current_year}/{current_month}...")
+    print(f"[STEP 11] Optimizing partition {current_year}/{current_month}...")
 
     for tbl in ["claims", "claim_diagnosis", "claim_lines"]:
         try:
@@ -588,7 +728,6 @@ try:
             """)
             print(f"[STEP 11] OPTIMIZE done → {tbl} ✅")
         except Exception as e:
-            # Non fatal — optimize failure should not fail the job
             print(f"[STEP 11] Warning — OPTIMIZE failed for {tbl}: {e}")
 
     job_status = "SUCCESS"
@@ -600,13 +739,9 @@ except Exception as e:
     raise
 
 finally:
-    # ─────────────────────────────────────────────────────────────────────────
-    # FINALLY — always runs whether job succeeds OR fails
-    # Saves watermark + commits job
-    # ─────────────────────────────────────────────────────────────────────────
-    print(f"[FINALLY] Job status: {job_status}")
-    print(f"[FINALLY] Files processed : {len(changed_files)}")
-    print(f"[FINALLY] Records merged  : {filtered_count}")
+    print(f"[FINALLY] Job status       : {job_status}")
+    print(f"[FINALLY] Files processed  : {len(changed_files)}")
+    print(f"[FINALLY] Records merged   : {filtered_count}")
 
     save_watermark(
         status          = job_status,
@@ -616,12 +751,11 @@ finally:
     )
 
     print("=" * 60)
-    print(f"[DONE] Job finished")
-    print(f"       Status          : {job_status}")
+    print(f"[DONE] Status          : {job_status}")
     print(f"       Mode            : {'FULL LOAD' if is_full_load else 'INCREMENTAL'}")
+    print(f"       Payer           : {PAYER_KEY}")
     print(f"       Files processed : {len(changed_files)}")
     print(f"       Records merged  : {filtered_count}")
-    print(f"       Payer (POC)     : 233")
     print(f"       Run timestamp   : {current_run_ts}")
     print("=" * 60)
 
