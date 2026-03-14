@@ -41,11 +41,16 @@ print(f"[INFO] PAYER_KEY → {PAYER_KEY}")
 # ── Safe runtime configs only ─────────────────────────────────────────────
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
-spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
+
+# ── Tell Spark what glue_catalog is ──────────────────────────────────────
+spark.conf.set("spark.sql.catalog.glue_catalog",
+               "org.apache.iceberg.spark.SparkCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl",
+               "org.apache.iceberg.aws.glue.GlueCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.io-impl",
+               "org.apache.iceberg.aws.s3.S3FileIO")
 spark.conf.set("spark.sql.catalog.glue_catalog.warehouse",
                f"s3://{TARGET_BUCKET}/iceberg/")
-spark.conf.set("spark.sql.catalog.glue_catalog.lock-impl",
-               "org.apache.iceberg.lock.NoLockManager")
 print("[INFO] Spark runtime configs set ✅")
 
 # ── Tracking variables for finally block ─────────────────────────────────────
@@ -665,8 +670,36 @@ try:
     lines_df.createOrReplaceTempView("lines_stage")
     print("[STEP 10A] Creating Iceberg tables if not exist...")
 
-    try:
-        spark.sql(f"""
+    # ── Helper: check whether a Glue/Iceberg table already exists ────────────
+    def _table_exists(database, table_name):
+        try:
+            spark.sql(f"DESCRIBE TABLE glue_catalog.{database}.{table_name}")
+            return True
+        except Exception:
+            return False
+
+    # ── Helper: create table only when it does not exist yet ─────────────────
+    # Using IF NOT EXISTS together with a pre-existence check avoids the
+    # NoSuchKeyException that Iceberg raises when the catalog tries to read
+    # non-existent S3 metadata during the IF-NOT-EXISTS resolution path.
+    def _safe_create_table(sql_ddl, table_label):
+        try:
+            spark.sql(sql_ddl)
+            print(f"[STEP 10A] {table_label} table ready ✅")
+        except Exception as e:
+            err_str = str(e)
+            # Treat "already exists" or "NoSuchKey" (metadata not yet present
+            # but table registered in Glue) as non-fatal warnings.
+            if ("already exists" in err_str.lower()
+                    or "nosuchkey" in err_str.lower()
+                    or "table already exists" in err_str.lower()):
+                print(f"[STEP 10A] {table_label} table already exists or metadata path not yet initialised — continuing ✅")
+            else:
+                print(f"[STEP 10A] {table_label} table warning: {e}")
+
+    # ── claims ────────────────────────────────────────────────────────────────
+    if not _table_exists(DATABASE, "claims"):
+        _safe_create_table(f"""
             CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claims (
                 payer_key                   bigint,
                 load_year                   int,
@@ -751,13 +784,18 @@ try:
             )
             USING iceberg
             PARTITIONED BY (payer_key, load_year, load_month)
-        """)
-        print("[STEP 10A] claims table ready ✅")
-    except Exception as e:
-        print(f"[STEP 10A] claims table warning: {e}")
+            LOCATION 's3://{TARGET_BUCKET}/iceberg/{DATABASE}/claims'
+            TBLPROPERTIES (
+                'format-version'              = '2',
+                'write.object-storage.enabled'= 'false'
+            )
+        """, "claims")
+    else:
+        print("[STEP 10A] claims table already exists — skipping CREATE ✅")
 
-    try:
-        spark.sql(f"""
+    # ── claim_diagnosis ───────────────────────────────────────────────────────
+    if not _table_exists(DATABASE, "claim_diagnosis"):
+        _safe_create_table(f"""
             CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claim_diagnosis (
                 payer_key                bigint,
                 member_key               bigint,
@@ -777,13 +815,18 @@ try:
             )
             USING iceberg
             PARTITIONED BY (payer_key, load_year, load_month)
-        """)
-        print("[STEP 10A] claim_diagnosis table ready ✅")
-    except Exception as e:
-        print(f"[STEP 10A] claim_diagnosis table warning: {e}")
+            LOCATION 's3://{TARGET_BUCKET}/iceberg/{DATABASE}/claim_diagnosis'
+            TBLPROPERTIES (
+                'format-version'              = '2',
+                'write.object-storage.enabled'= 'false'
+            )
+        """, "claim_diagnosis")
+    else:
+        print("[STEP 10A] claim_diagnosis table already exists — skipping CREATE ✅")
 
-    try:
-        spark.sql(f"""
+    # ── claim_lines ───────────────────────────────────────────────────────────
+    if not _table_exists(DATABASE, "claim_lines"):
+        _safe_create_table(f"""
             CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claim_lines (
                 payer_key                    bigint,
                 member_key                   bigint,
@@ -838,10 +881,14 @@ try:
             )
             USING iceberg
             PARTITIONED BY (payer_key, load_year, load_month)
-        """)
-        print("[STEP 10A] claim_lines table ready ✅")
-    except Exception as e:
-        print(f"[STEP 10A] claim_lines table warning: {e}")
+            LOCATION 's3://{TARGET_BUCKET}/iceberg/{DATABASE}/claim_lines'
+            TBLPROPERTIES (
+                'format-version'              = '2',
+                'write.object-storage.enabled'= 'false'
+            )
+        """, "claim_lines")
+    else:
+        print("[STEP 10A] claim_lines table already exists — skipping CREATE ✅")
 
     # ── Iceberg overwrite helper — incremental-safe ───────────────────────────
     # FULL LOAD  → overwritePartitions() directly (replaces everything).
