@@ -1,6 +1,3 @@
-Here is the complete full script:
-
-```python
 import sys
 import json
 import boto3
@@ -41,9 +38,14 @@ print(f"[INFO] Target    → {TARGET_BUCKET_S3}")
 print(f"[INFO] DB        → {DATABASE}")
 print(f"[INFO] PAYER_KEY → {PAYER_KEY}")
 
-# ── Safe runtime configs only ─────────────────────────────────────────────────
+# ── Safe runtime configs only ─────────────────────────────────────────────
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.warehouse",
+               f"s3://{TARGET_BUCKET}/iceberg/")
+spark.conf.set("spark.sql.catalog.glue_catalog.lock-impl",
+               "org.apache.iceberg.lock.NoLockManager")
 print("[INFO] Spark runtime configs set ✅")
 
 # ── Tracking variables for finally block ─────────────────────────────────────
@@ -359,15 +361,15 @@ try:
             safe_col("encounterRelated").alias("encounter_related"),
             safe_col("encounterUnrelated").alias("encounter_unrelated"),
             safe_col("encounterClaimRequested").alias("encounter_claim_requested"),
-            normalize_date(F.col("serviceBeginDate")).alias("service_begin_date"),
-            normalize_date(F.col("serviceThruDate")).alias("service_thru_date"),
-            normalize_date(F.col("datePaid")).alias("date_paid"),
-            normalize_date(F.col("claimReceivedDate")).alias("claim_received_date"),
+            normalize_date(safe_col("serviceBeginDate")).alias("service_begin_date"),
+            normalize_date(safe_col("serviceThruDate")).alias("service_thru_date"),
+            normalize_date(safe_col("datePaid")).alias("date_paid"),
+            normalize_date(safe_col("claimReceivedDate")).alias("claim_received_date"),
             F.col("claim_load_ts").alias("claim_load_datetime"),
             normalize_ts(safe_col("claimTransferredDateTime")).alias("claim_transferred_datetime"),
-            normalize_ts(F.col("createdAt")).alias("created_at"),
-            normalize_ts(F.col("updatedAt")).alias("updated_at"),
-            F.col("updatedAt").cast("long").alias("updated_at_epoch"),
+            normalize_ts(safe_col("createdAt")).alias("created_at"),
+            normalize_ts(safe_col("updatedAt")).alias("updated_at"),
+            safe_col("updatedAt", "long").alias("updated_at_epoch"),
             safe_col("legacySource").alias("legacy_source"),
             safe_col("legacySchema").alias("legacy_schema"),
             safe_col("legacyID").alias("legacy_id"),
@@ -661,56 +663,272 @@ try:
     claims_df.createOrReplaceTempView("claims_stage")
     diagnosis_df.createOrReplaceTempView("diagnosis_stage")
     lines_df.createOrReplaceTempView("lines_stage")
+    print("[STEP 10A] Creating Iceberg tables if not exist...")
 
     try:
         spark.sql(f"""
-            MERGE INTO glue_catalog.{DATABASE}.claims AS t
-            USING claims_stage AS s
-            ON  t.payer_key   = s.payer_key
-            AND t.load_year   = s.load_year
-            AND t.load_month  = s.load_month
-            AND t.member_key  = s.member_key
-            AND t.claim_key   = s.claim_key
-            WHEN MATCHED AND s.updated_at_epoch > t.updated_at_epoch
-                THEN UPDATE SET *
-            WHEN NOT MATCHED
-                THEN INSERT *
+            CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claims (
+                payer_key                   bigint,
+                load_year                   int,
+                load_month                  int,
+                member_key                  bigint,
+                claim_key                   bigint,
+                employer_group_key          bigint,
+                inbound_batch_master_key    bigint,
+                batch_run_sequence          int,
+                stage_claim_key             bigint,
+                claim_number                string,
+                claim_status                string,
+                claim_source                string,
+                claim_type                  string,
+                claim_method                string,
+                form_type                   string,
+                type_of_bill                string,
+                client_data_feed_code       string,
+                source_system_id            string,
+                plan_type                   string,
+                union_type                  string,
+                hospital_account_number     string,
+                patient_discharge_status    string,
+                place_of_service            string,
+                prior_claim_reference       string,
+                manipulation_reason         string,
+                billing_provider_name       string,
+                billing_provider_tin        string,
+                billing_provider_npi        string,
+                billing_provider_id         string,
+                billing_provider_address1   string,
+                billing_provider_address2   string,
+                billing_provider_city       string,
+                billing_provider_state      string,
+                billing_provider_zip        string,
+                billing_provider_phone      string,
+                billing_provider_email      string,
+                billing_provider_contact_name  string,
+                billing_provider_contact_phone string,
+                treating_physician_name     string,
+                treating_provider_tin       string,
+                treating_provider_medicare  string,
+                referring_provider_tin      string,
+                admit_provider_tin          string,
+                physician_provider_tin      string,
+                provider_type               string,
+                provider_class              string,
+                reimbursement_method        string,
+                is_capitated_claim          string,
+                is_medicare                 string,
+                is_split_claim              string,
+                is_workers_comp             string,
+                is_participating_provider   string,
+                is_encounter                string,
+                adjustment_indicator        string,
+                assignment_flag             string,
+                accident_flag               string,
+                include_encounter_as_paid   string,
+                total_billed_amount         decimal(18,2),
+                total_client_paid_amount    decimal(18,2),
+                total_member_paid_amount    decimal(18,2),
+                check_number                string,
+                interest_allowed            string,
+                interest_claim_key          bigint,
+                encounter_claim_key         bigint,
+                encounter_related           string,
+                encounter_unrelated         string,
+                encounter_claim_requested   string,
+                service_begin_date          date,
+                service_thru_date           date,
+                date_paid                   date,
+                claim_received_date         date,
+                claim_load_datetime         timestamp,
+                claim_transferred_datetime  timestamp,
+                created_at                  timestamp,
+                updated_at                  timestamp,
+                updated_at_epoch            bigint,
+                legacy_source               string,
+                legacy_schema               string,
+                legacy_id                   string,
+                tracking_info               string
+            )
+            USING iceberg
+            PARTITIONED BY (payer_key, load_year, load_month)
         """)
-        print("[STEP 10] Claims MERGE ✅")
+        print("[STEP 10A] claims table ready ✅")
     except Exception as e:
-        raise Exception(f"[STEP 10] FAILED claims MERGE: {e}")
+        print(f"[STEP 10A] claims table warning: {e}")
 
     try:
         spark.sql(f"""
-            MERGE INTO glue_catalog.{DATABASE}.claim_diagnosis AS t
-            USING diagnosis_stage AS s
-            ON  t.payer_key       = s.payer_key
-            AND t.load_year       = s.load_year
-            AND t.load_month      = s.load_month
-            AND t.claim_key       = s.claim_key
-            AND t.diagnosis_order = s.diagnosis_order
-            WHEN MATCHED THEN UPDATE SET *
-            WHEN NOT MATCHED THEN INSERT *
+            CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claim_diagnosis (
+                payer_key                bigint,
+                member_key               bigint,
+                claim_key                bigint,
+                load_year                int,
+                load_month               int,
+                diagnosis_code           string,
+                diagnosis_order          int,
+                is_primary               string,
+                is_sensitive             int,
+                is_trauma                int,
+                version_indicator        int,
+                client_data_feed_code    string,
+                inbound_batch_master_key bigint,
+                batch_run_sequence       int,
+                claim_diagnosis_key      bigint
+            )
+            USING iceberg
+            PARTITIONED BY (payer_key, load_year, load_month)
         """)
-        print("[STEP 10] Diagnosis MERGE ✅")
+        print("[STEP 10A] claim_diagnosis table ready ✅")
     except Exception as e:
-        raise Exception(f"[STEP 10] FAILED diagnosis MERGE: {e}")
+        print(f"[STEP 10A] claim_diagnosis table warning: {e}")
 
     try:
         spark.sql(f"""
-            MERGE INTO glue_catalog.{DATABASE}.claim_lines AS t
-            USING lines_stage AS s
-            ON  t.payer_key         = s.payer_key
-            AND t.load_year         = s.load_year
-            AND t.load_month        = s.load_month
-            AND t.claim_key         = s.claim_key
-            AND t.claim_line_number = s.claim_line_number
-            WHEN MATCHED THEN UPDATE SET *
-            WHEN NOT MATCHED THEN INSERT *
+            CREATE TABLE IF NOT EXISTS glue_catalog.{DATABASE}.claim_lines (
+                payer_key                    bigint,
+                member_key                   bigint,
+                claim_key                    bigint,
+                load_year                    int,
+                load_month                   int,
+                claim_line_key               bigint,
+                claim_line_number            string,
+                procedure_code               string,
+                procedure_code_type          string,
+                billed_amount                decimal(18,2),
+                client_paid_amount           decimal(18,2),
+                member_paid                  decimal(18,2),
+                allowed_amount               decimal(18,2),
+                covered_amount               decimal(18,2),
+                discount_amount              decimal(18,2),
+                discount_reason              string,
+                excluded_amount              decimal(18,2),
+                excluded_reason              string,
+                withhold_amount              decimal(18,2),
+                withhold_reason              string,
+                provider_paid_amount         decimal(18,2),
+                original_client_paid_amount  decimal(18,2),
+                previous_paid_amount         decimal(18,2),
+                date_of_service_from         date,
+                date_of_service_thru         date,
+                modifier_code_01             string,
+                modifier_code_02             string,
+                place_of_service             string,
+                revenue_code                 string,
+                service_type                 string,
+                quantity                     decimal(10,2),
+                house_code                   string,
+                house_code_description       string,
+                payment_type                 string,
+                payment_type_id              string,
+                payment_comments             string,
+                check_number                 string,
+                transaction_code             string,
+                transaction_description      string,
+                adjustment_flag              string,
+                is_primary_ndc               string,
+                insured_term_date            string,
+                manipulation_reason          string,
+                claim_detail_status          string,
+                client_data_feed_code        string,
+                inbound_batch_master_key     bigint,
+                batch_run_sequence           int,
+                stage_claim_line_key         bigint,
+                updated_at                   timestamp,
+                created_at                   timestamp
+            )
+            USING iceberg
+            PARTITIONED BY (payer_key, load_year, load_month)
         """)
-        print("[STEP 10] Claim Lines MERGE ✅")
+        print("[STEP 10A] claim_lines table ready ✅")
     except Exception as e:
-        raise Exception(f"[STEP 10] FAILED claim lines MERGE: {e}")
+        print(f"[STEP 10A] claim_lines table warning: {e}")
+
+    # ── Iceberg overwrite helper — incremental-safe ───────────────────────────
+    # FULL LOAD  → overwritePartitions() directly (replaces everything).
+    # INCREMENTAL→ read existing Iceberg partition back, union with incoming
+    #              data, deduplicate keeping the newest record per key, then
+    #              overwritePartitions().  This preserves records from previous
+    #              runs that are NOT in the current batch.
+    def iceberg_overwrite(stage_df, table_fqn, pk_cols, updated_at_col=None):
+        if is_full_load:
+            stage_df.writeTo(table_fqn).overwritePartitions()
+            return
+
+        # Identify the distinct (payer_key, load_year, load_month) partitions
+        # present in the incoming batch so we only read back those partitions.
+        partition_cols = ["payer_key", "load_year", "load_month"]
+        incoming_partitions = stage_df.select(partition_cols).distinct()
+
+        # Read only the matching partitions from Iceberg
+        existing_df = (
+            spark.table(table_fqn)
+            .join(incoming_partitions, on=partition_cols, how="inner")
+        )
+
+        # Union existing + incoming, then deduplicate keeping the newest row.
+        # If no updated_at_col is available (diagnosis / lines), last-write wins
+        # by simply preferring the incoming row for any duplicate key.
+        combined = existing_df.unionByName(stage_df)
+
+        if updated_at_col:
+            # Keep the row with the highest updated_at_col value per pk_cols
+            from pyspark.sql import Window
+            w = Window.partitionBy(pk_cols).orderBy(F.col(updated_at_col).desc())
+            combined = (
+                combined
+                .withColumn("_rn", F.row_number().over(w))
+                .filter(F.col("_rn") == 1)
+                .drop("_rn")
+            )
+        else:
+            # Prefer incoming rows: tag them priority=0, existing=1, keep lowest
+            from pyspark.sql import Window
+            stage_tagged    = stage_df.withColumn("_src", F.lit(0))
+            existing_tagged = existing_df.withColumn("_src", F.lit(1))
+            combined_tagged = existing_tagged.unionByName(stage_tagged)
+            w = Window.partitionBy(pk_cols).orderBy(F.col("_src").asc())
+            combined = (
+                combined_tagged
+                .withColumn("_rn", F.row_number().over(w))
+                .filter(F.col("_rn") == 1)
+                .drop("_rn", "_src")
+            )
+
+        combined.writeTo(table_fqn).overwritePartitions()
+
+    # ── OVERWRITE: claims ─────────────────────────────────────────────────────
+    try:
+        iceberg_overwrite(
+            stage_df       = claims_df,
+            table_fqn      = f"glue_catalog.{DATABASE}.claims",
+            pk_cols        = ["payer_key", "load_year", "load_month", "member_key", "claim_key"],
+            updated_at_col = "updated_at_epoch"
+        )
+        print("[STEP 10] Claims OVERWRITE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED claims OVERWRITE: {e}")
+
+    # ── OVERWRITE: claim_diagnosis ────────────────────────────────────────────
+    try:
+        iceberg_overwrite(
+            stage_df  = diagnosis_df,
+            table_fqn = f"glue_catalog.{DATABASE}.claim_diagnosis",
+            pk_cols   = ["payer_key", "load_year", "load_month", "claim_key", "diagnosis_order"]
+        )
+        print("[STEP 10] Diagnosis OVERWRITE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED diagnosis OVERWRITE: {e}")
+
+    # ── OVERWRITE: claim_lines ────────────────────────────────────────────────
+    try:
+        iceberg_overwrite(
+            stage_df  = lines_df,
+            table_fqn = f"glue_catalog.{DATABASE}.claim_lines",
+            pk_cols   = ["payer_key", "load_year", "load_month", "claim_key", "claim_line_number"]
+        )
+        print("[STEP 10] Claim Lines OVERWRITE ✅")
+    except Exception as e:
+        raise Exception(f"[STEP 10] FAILED claim lines OVERWRITE: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 11 — OPTIMIZE CURRENT MONTH PARTITION
