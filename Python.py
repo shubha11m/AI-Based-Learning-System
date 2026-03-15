@@ -454,7 +454,7 @@ def _safe_write(df, table_fqn, label, overwrite_partitions=True):
     if not _iceberg_metadata_exists(table_name):
         print(f"[WARN] {label}: S3 metadata absent — repairing Glue catalog before write")
         _glue_drop_and_recreate(table_fqn, label)
-        df.writeTo(table_fqn).append()
+        _iceberg_append(df, table_fqn, label)
         print(f"[INFO] {label}: post-repair append ✅")
         return
     if overwrite_partitions:
@@ -467,15 +467,14 @@ def _safe_write(df, table_fqn, label, overwrite_partitions=True):
                 raise
             print(f"[WARN] {label}: overwritePartitions → NoSuchKey, trying append()")
     try:
-        df.writeTo(table_fqn).append()
-        print(f"[INFO] {label}: append ✅")
+        _iceberg_append(df, table_fqn, label)
         return
     except Exception as e2:
         if not _is_nosuchkey(e2):
             raise
         print(f"[WARN] {label}: append() → NoSuchKey, repairing Glue catalog via boto3")
     _glue_drop_and_recreate(table_fqn, label)
-    df.writeTo(table_fqn).append()
+    _iceberg_append(df, table_fqn, label)
     print(f"[INFO] {label}: post-repair append ✅")
 
 # =============================================================================
@@ -1075,20 +1074,50 @@ try:
             .drop("claim_updated_at_epoch_ms")
 
             # ── STEP 10 (per chunk) — WRITE ────────────────────────────────
-            # spark.sql("MERGE INTO") → UnsupportedOperationException
-            # DataFrame.merge()       → AttributeError: no attribute 'merge'
-            # Both are unavailable in this Glue Spark version.
+            # Only confirmed working write in this Glue/Iceberg version:
+            #   .writeTo(table).overwritePartitions()
             #
-            # Solution: pure DELETE + INSERT using Iceberg DataFrameWriterV2.
+            # Strategy for incremental (no DELETE, no MERGE, no append):
             #
             # CLAIMS:
-            #   Only delete+replace rows where incoming epoch > existing epoch.
-            #   Rows where existing data is already newer are left untouched.
+            #   Read existing rows for affected (payerkey,loadyear,loadmonth)
+            #   partitions. Union with incoming. Keep highest epoch per claimkey
+            #   via dropDuplicates. overwritePartitions → atomically replaces
+            #   only those partitions.
             #
             # DIAGNOSIS / LINES:
-            #   Delete ALL existing rows for the affected claimkeys, then
-            #   insert the complete new list from the JSON file.
-            #   This correctly handles lines/diagnoses being added or removed.
+            #   Read existing rows for affected partitions. Remove rows whose
+            #   claimkey is in this chunk (they are being replaced). Union with
+            #   new rows. overwritePartitions.
+
+            # Collect the distinct partition values this chunk touches — used
+            # to scope the existing-data read to only affected partitions.
+            affected_partitions = (
+                claims_df
+                .select("payerkey", "loadyear", "loadmonth")
+                .distinct()
+                .collect()
+            )
+
+            def _partition_filter(df_or_table_name, is_table=False):
+                """
+                Return a DataFrame filtered to only the partitions this chunk
+                affects. Reads from Iceberg table when is_table=True.
+                """
+                if is_table:
+                    base = spark.table(df_or_table_name)
+                else:
+                    base = df_or_table_name
+                if not affected_partitions:
+                    return base.filter(F.lit(False))
+                cond = F.lit(False)
+                for row in affected_partitions:
+                    cond = cond | (
+                        (F.col("payerkey")  == row.payerkey)  &
+                        (F.col("loadyear")  == row.loadyear)  &
+                        (F.col("loadmonth") == row.loadmonth)
+                    )
+                return base.filter(cond)
 
             # ── CLAIMS ────────────────────────────────────────────────────
             if is_full_load:
@@ -1097,50 +1126,22 @@ try:
             else:
                 claims_tbl = f"glue_catalog.{DATABASE}.claims"
 
-                # Get the max existing epoch for each incoming claimkey so we
-                # only replace rows where the incoming data is actually newer.
-                existing_epochs = (
-                    spark.table(claims_tbl)
-                    .join(
-                        claims_df.select(
-                            "payerkey", "loadyear", "loadmonth",
-                            "memberkey", "claimkey"
-                        ),
-                        on=["payerkey", "loadyear", "loadmonth",
-                            "memberkey", "claimkey"],
-                        how="inner"
-                    )
-                    .select("payerkey", "loadyear", "loadmonth",
-                            "memberkey", "claimkey",
-                            F.col("updatedatepoch").alias("existing_epoch"))
-                )
+                # Read existing rows in affected partitions
+                existing_claims = _partition_filter(claims_tbl, is_table=True)
 
-                # Only keep incoming claims that are newer than what is stored
-                claims_to_write = (
-                    claims_df.alias("s")
-                    .join(
-                        existing_epochs.alias("e"),
-                        on=["payerkey", "loadyear", "loadmonth",
-                            "memberkey", "claimkey"],
-                        how="left"
+                # Union: existing rows + incoming rows, then keep the one with
+                # the highest updatedatepoch per claimkey (incoming wins if newer)
+                merged_claims = (
+                    existing_claims
+                    .unionByName(claims_df)
+                    .sortWithinPartitions(
+                        F.col("updatedatepoch").desc_nulls_last()
                     )
-                    .filter(
-                        F.col("e.existing_epoch").isNull() |
-                        (F.col("s.updatedatepoch") > F.col("e.existing_epoch"))
-                    )
-                    .select("s.*")
+                    .dropDuplicates(["payerkey", "loadyear", "loadmonth",
+                                     "memberkey", "claimkey"])
                 )
-
-                # Delete existing rows only for claims we are actually replacing
-                claims_to_write.createOrReplaceTempView("claims_newer_stage")
-                spark.sql(f"""
-                    DELETE FROM {claims_tbl}
-                    WHERE (payerkey, loadyear, loadmonth, memberkey, claimkey)
-                    IN (SELECT payerkey, loadyear, loadmonth, memberkey, claimkey
-                        FROM claims_newer_stage)
-                """)
-                claims_to_write.writeTo(claims_tbl).append()
-                print(f"[CHUNK {chunk_idx+1}] claims DELETE+INSERT ✅")
+                _safe_write(merged_claims, claims_tbl, "claims")
+                print(f"[CHUNK {chunk_idx+1}] claims overwritePartitions ✅")
 
             # ── CLAIM DIAGNOSIS ───────────────────────────────────────────
             if is_full_load:
@@ -1149,15 +1150,26 @@ try:
                             "claimdiagnosis")
             else:
                 dx_tbl = f"glue_catalog.{DATABASE}.claimdiagnosis"
-                diagnosis_df.createOrReplaceTempView("dx_stage")
-                spark.sql(f"""
-                    DELETE FROM {dx_tbl}
-                    WHERE (payerkey, loadyear, loadmonth, memberkey, claimkey)
-                    IN (SELECT DISTINCT payerkey, loadyear, loadmonth,
-                               memberkey, claimkey FROM dx_stage)
-                """)
-                diagnosis_df.writeTo(dx_tbl).append()
-                print(f"[CHUNK {chunk_idx+1}] claimdiagnosis DELETE+INSERT ✅")
+
+                # Claimkeys being replaced in this chunk
+                replaced_claimkeys = (
+                    diagnosis_df
+                    .select("payerkey", "loadyear", "loadmonth",
+                            "memberkey", "claimkey")
+                    .distinct()
+                )
+
+                # Keep existing rows NOT being replaced, then add new rows
+                existing_dx = (
+                    _partition_filter(dx_tbl, is_table=True)
+                    .join(replaced_claimkeys,
+                          on=["payerkey", "loadyear", "loadmonth",
+                              "memberkey", "claimkey"],
+                          how="left_anti")
+                )
+                merged_dx = existing_dx.unionByName(diagnosis_df)
+                _safe_write(merged_dx, dx_tbl, "claimdiagnosis")
+                print(f"[CHUNK {chunk_idx+1}] claimdiagnosis overwritePartitions ✅")
 
             # ── CLAIM LINES ───────────────────────────────────────────────
             if is_full_load:
@@ -1165,15 +1177,24 @@ try:
                             f"glue_catalog.{DATABASE}.claimlines", "claimlines")
             else:
                 ln_tbl = f"glue_catalog.{DATABASE}.claimlines"
-                lines_df.createOrReplaceTempView("ln_stage")
-                spark.sql(f"""
-                    DELETE FROM {ln_tbl}
-                    WHERE (payerkey, loadyear, loadmonth, memberkey, claimkey)
-                    IN (SELECT DISTINCT payerkey, loadyear, loadmonth,
-                               memberkey, claimkey FROM ln_stage)
-                """)
-                lines_df.writeTo(ln_tbl).append()
-                print(f"[CHUNK {chunk_idx+1}] claimlines DELETE+INSERT ✅")
+
+                replaced_claimkeys_ln = (
+                    lines_df
+                    .select("payerkey", "loadyear", "loadmonth",
+                            "memberkey", "claimkey")
+                    .distinct()
+                )
+
+                existing_ln = (
+                    _partition_filter(ln_tbl, is_table=True)
+                    .join(replaced_claimkeys_ln,
+                          on=["payerkey", "loadyear", "loadmonth",
+                              "memberkey", "claimkey"],
+                          how="left_anti")
+                )
+                merged_ln = existing_ln.unionByName(lines_df)
+                _safe_write(merged_ln, ln_tbl, "claimlines")
+                print(f"[CHUNK {chunk_idx+1}] claimlines overwritePartitions ✅")
 
             total_written += chunk_count
             print(f"[CHUNK {chunk_idx+1}/{num_chunks}] Written ✅  "
