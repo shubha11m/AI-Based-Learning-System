@@ -30,11 +30,12 @@ NEW for 10 M / 50 M scale (2026-03-16)
     S3_LIST_WORKERS raised to 200 (50 M tier) — saturates the S3 list API.
     PaginationConfig PageSize raised to 1000 (already maximal; kept explicit).
 
-13. MEMORY_AND_DISK_SER (serialised cache) for large chunks
+13. MEMORY_AND_DISK serialised cache for large chunks
     At 50 M scale a single chunk can be 50 K rows × wide schema.
-    MEMORY_AND_DISK_SER halves executor heap pressure vs MEMORY_AND_DISK.
-    Java serializer (NOT Kryo) is used — safe because serializer is set
-    before SparkContext via Glue job parameter.
+    Serialised storage (deserialized=False in PySpark StorageLevel constructor)
+    halves executor heap pressure vs raw object storage.
+    Note: StorageLevel.MEMORY_AND_DISK_SER is Scala-only and raises
+    AttributeError in PySpark — use StorageLevel(True,True,False,False,1).
 
 14. ICEBERG copy-on-write for FULL LOAD
     write.merge.mode / update.mode / delete.mode switched to copy-on-write
@@ -48,6 +49,39 @@ NEW for 10 M / 50 M scale (2026-03-16)
 16. GLUE WORKER HINTS printed at startup
     Operator sees the recommended worker type / count / timeout for the
     detected scale tier at the top of the log.
+
+17. DUAL JSON TYPE HANDLING (2026-03-16)
+    Two JSON casing conventions arrive from upstream systems:
+      Type 1 — PascalCase top-level keys AND PascalCase array-item keys
+               e.g. PayerKey, MemberKey, ClaimKey, ClaimLoadDateTime,
+                    UpdatedAt, DiagnosisCode, ClaimLineKey …
+      Type 2 — camelCase top-level keys AND camelCase array-item keys
+               e.g. payerKey, memberKey, claimKey, claimLoadDateTime,
+                    updatedAt, diagnosisCode, claimLineKey …
+
+    Three rules applied everywhere:
+
+    Rule 1 — spark.sql.caseSensitive=true
+      Required so that PascalCase and camelCase variants declared in the
+      same StructType are treated as DISTINCT columns (no duplicate-column
+      AnalysisException).
+
+    Rule 2 — All resolved_* / claim_load_ts columns use guarded coalesces
+      Python-time checks on _json_df.columns prevent referencing a missing
+      column under caseSensitive=true.  Example:
+        F.col("payerKey").cast("long") if "payerKey" in _json_df.columns …
+
+    Rule 3 — safe_col() helper coalesces both casings for every top-level
+      claim field so STEP 7 (claims DF) works for both types.
+
+    Rule 4 — Explicit read schemas (_DX_READ_SCHEMA / _LN_READ_SCHEMA)
+      declare BOTH camelCase + PascalCase top-level keys AND both possible
+      array-column names (e.g. claimDiagnosisList + ClaimDiagnosisList) so
+      a SINGLE spark.read handles either JSON type without two passes.
+
+    Rule 5 — _dx() / _ln() coalesce helpers pick the correct struct field:
+        coalesce(_dxrow.diagnosisCode, _dxrow.DiagnosisCode)
+      → non-null in exactly one casing per row.
 
 Scale tiers
 ──────────────────────────────────────────────────────────────────────
@@ -78,12 +112,47 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import (StructType, StructField, ArrayType,
+                                StringType, IntegerType, LongType)
 from pyspark.storagelevel import StorageLevel
 from datetime import datetime
 
 # ── Job arguments ─────────────────────────────────────────────────────────────
-args         = getResolvedOptions(sys.argv, ['JOB_NAME', 'param1', 'param2'])
-RUN_OPTIMIZE = args.get('run_optimize', 'false').lower() == 'true'
+# Required args — Glue raises an error at startup if any are missing.
+#   JOB_NAME  — Glue job name (injected automatically)
+#   param1    — ENV  e.g. DEV / UAT / PROD
+#   param2    — RUN  e.g. WORKDAY-5
+#   payer_key — payer identifier e.g. 366, 500, 1001
+#               Each payer gets its own watermark so runs are fully isolated.
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'param1', 'param2', 'payer_key'])
+
+# Optional args — getResolvedOptions only populates keys you explicitly declare.
+# Parse optional params directly from sys.argv via _get_optional_arg().
+def _get_optional_arg(argv, key, default):
+    """Parse --key value pairs from sys.argv. Case-insensitive. Returns default if absent."""
+    key_flag = f"--{key}"
+    for i, token in enumerate(argv):
+        if token.lower() == key_flag.lower() and i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+# Optional overrides — pass as Glue job parameters to change without editing code
+SCALE_TIER    = _get_optional_arg(sys.argv, 'scale_tier',    'small').lower()
+RUN_OPTIMIZE  = _get_optional_arg(sys.argv, 'run_optimize',  'false').lower() == 'true'
+SOURCE_BUCKET = _get_optional_arg(sys.argv, 'source_bucket', 'nontrauma-claim-prod')
+TARGET_BUCKET = _get_optional_arg(sys.argv, 'target_bucket', 'nontrauma-analytics-prod')
+DATABASE      = _get_optional_arg(sys.argv, 'database',      'claims_db_dev')
+
+print(f"[ARGS] JOB_NAME      = {args['JOB_NAME']}")
+print(f"[ARGS] param1(ENV)   = {args['param1']}")
+print(f"[ARGS] param2(RUN)   = {args['param2']}")
+print(f"[ARGS] payer_key     = {args['payer_key']}")
+print(f"[ARGS] source_bucket = {SOURCE_BUCKET}")
+print(f"[ARGS] target_bucket = {TARGET_BUCKET}")
+print(f"[ARGS] database      = {DATABASE}")
+print(f"[ARGS] scale_tier    = {SCALE_TIER}  "
+      f"({'explicit' if '--scale_tier' in ' '.join(sys.argv).lower() else 'DEFAULT'})")
+print(f"[ARGS] run_optimize  = {RUN_OPTIMIZE}")
 
 # ── Glue / Spark bootstrap ────────────────────────────────────────────────────
 sc          = SparkContext()
@@ -92,77 +161,279 @@ spark       = glueContext.spark_session
 job         = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-ENV = args['param1']
-RUN = args['param2']
+ENV       = args['param1']
+RUN       = args['param2']
+PAYER_KEY = args['payer_key'].strip()   # e.g. "366" — drives S3 prefix + watermark
 
 # ── Scale tier configuration ──────────────────────────────────────────────────
-# Pass --scale_tier small | medium_10m | large_50m as a Glue job parameter.
+# Pass --scale_tier micro | small | medium_10m | large_50m as Glue job param.
 # Defaults to 'small' if not supplied (backward-compatible with existing jobs).
 #
-# Tier          Files        Members  Chunk  ListW  Shuffle  FileMB  Workers
-# small         < 500 K      < 5 K    1 000    100     400     256    50 G.2X
-# medium_10m    ~ 10 M       ~100 K   2 000    150   1 600     512   100 G.2X
-# large_50m     ~ 50 M       ~500 K   3 000    200   4 000     512   200 G.2X
+# HOW TO CHOOSE YOUR TIER  (payer 366 is the reference: 19,915 members / 62,936 files)
+# ─────────────────────────────────────────────────────────────────────────────────────
+#
+#   micro                 <  500K  files /   < 5K  members  → tiny payers, 10 workers
+#   small                 <  500K  files /  < 50K  members  → payer 366 (62K files/19K members) ✓
+#   medium_10m            ~   10M  files / ~ 100K  members  → mid-size payers, 100 workers
+#   medium_250k           ~  20M+  files / ~ 300K  members  → payer 326 ACTUAL (19.8M/264K) ✓
+#   medium_250k_lowdensity ~  800K  files / ~ 300K  members  → payer 326 ORIGINAL ESTIMATE
+#   large_50m             ~   50M  files / ~ 500K  members  → large payers, 200 workers
+#
+# PAYER 366 → use --scale_tier small
+#   Members : 19,915  (< 50K ✓)
+#   Files   : 62,936  (< 500K ✓)
+#   Workers : 40 G.1X → 62K files in ~20 chunks of 1K members → ~80 min total
+#
+# PAYER 326 → use --scale_tier medium_250k  (CORRECTED after first real run 2026-03-17)
+#   Members : 264,260
+#   Files   : 19,841,184  (~75 files/member — much higher than initial estimate of ~3)
+#   Workers : 100 G.2X
+#   Chunks  : ceil(264,260 ÷ 160) = 1,652 chunks × ~15 min = ~17h total
+#   Timeout : 1,440 min (24h) — set in Glue job settings
+#   Note    : If job times out mid-run, re-run resumes from last checkpoint automatically.
+#
+# KEY TUNING — files_per_partition:
+#   With multiline JSON Spark creates 1 task per input FILE.
+#   files_per_partition controls how many files are grouped into one
+#   partition BEFORE persist() via repartition().
+#   Too small → thousands of tiny tasks → scheduler overhead → slow.
+#   Rule of thumb: target 20–50 total partitions per chunk.
+#
+# Tier                    Files       Members  Chunk  ListW  Shuffle  FileMB  Workers
+# micro                   < 500K      <  5K      500     20     100      32    10 G.1X
+# small                   < 500K      < 50K    1 000     40     160      64    40 G.1X  ← payer 366
+# medium_10m              ~  10M      ~100K    2 000    150     400     256   100 G.2X
+# medium_250k             ~  20M+     ~300K      160    150     400     256   100 G.2X  ← payer 326 ACTUAL
+# medium_250k_lowdensity  ~ 800K      ~300K    3 000    150     600     256   100 G.2X  ← payer 326 estimate
+# large_50m               ~  50M      ~500K    3 000    200   1 000     512   200 G.2X
 
 _SCALE_CONFIG = {
+    # ── micro ── < 500K files / < 5K members ──────────────────────────────────
+    "micro": {
+        "member_chunk_size":        500,
+        "s3_list_workers":          20,
+        "base_shuffle_partitions":  100,
+        "files_per_partition":      25,
+        "max_shuffle_partitions":   400,
+        "iceberg_file_size_bytes":  32  * 1024 * 1024,
+        "cache_level_ser":          False,
+        "glue_worker_type":         "G.1X",
+        "glue_workers":             10,
+        "glue_timeout_min":         120,
+        "auto_optimize_full_load":  False,
+        "parallel_table_writes":    False,
+        "single_read_cache":        False,
+    },
+    # ── small ── < 500K files / < 50K members  (payer 366: 62K files / 19K members) ──
+    # TUNED 2026-03-16:
+    #   files_per_partition 50 → 100  : 3K files/chunk → 30 partitions (was 65)
+    #                                   Halves the repartition shuffle cost.
+    #   base_shuffle_partitions 200→160: matches ~30 partitions × 4 with AQE headroom.
+    #   glue_workers 20 → 40          : doubles parallelism → ~4 min/chunk (was ~8 min).
+    #                                   Use G.1X × 40 in Glue job settings.
     "small": {
         "member_chunk_size":        1_000,
-        "s3_list_workers":          100,
-        "base_shuffle_partitions":  400,
-        "files_per_partition":      50,
-        "max_shuffle_partitions":   2_000,
-        "iceberg_file_size_bytes":  256 * 1024 * 1024,   # 256 MB
+        "s3_list_workers":          40,
+        "base_shuffle_partitions":  160,
+        "files_per_partition":      100,
+        "max_shuffle_partitions":   800,
+        "iceberg_file_size_bytes":  64  * 1024 * 1024,
         "cache_level_ser":          False,
-        "glue_worker_type":         "G.2X",
-        "glue_workers":             50,
-        "glue_timeout_min":         480,
+        "glue_worker_type":         "G.1X",
+        "glue_workers":             40,
+        "glue_timeout_min":         240,
         "auto_optimize_full_load":  False,
+        "parallel_table_writes":    False,
+        "single_read_cache":        False,
     },
+    # ── medium_10m ── ~10M files / ~100K members ──────────────────────────────
+    # base_shuffle_partitions lowered 1600 → 400.  Old value gave 1600 shuffle
+    # tasks for a 9K-row chunk — massive scheduler overhead.  AQE coalesces.
+    # files_per_partition raised 50 → 200 so 9K files → 45 partitions (not 189).
+    # cache_level_ser False — serialised cache adds CPU cost for small data.
     "medium_10m": {
         "member_chunk_size":        2_000,
         "s3_list_workers":          150,
-        "base_shuffle_partitions":  1_600,
-        "files_per_partition":      50,
+        "base_shuffle_partitions":  400,
+        "files_per_partition":      200,
         "max_shuffle_partitions":   4_000,
-        "iceberg_file_size_bytes":  512 * 1024 * 1024,   # 512 MB
-        "cache_level_ser":          True,
+        "iceberg_file_size_bytes":  256 * 1024 * 1024,
+        "cache_level_ser":          False,
         "glue_worker_type":         "G.2X",
         "glue_workers":             100,
         "glue_timeout_min":         720,
         "auto_optimize_full_load":  True,
+        "parallel_table_writes":    False,
+        "single_read_cache":        False,
     },
+    # ── medium_250k ── ~1M files / ~300K members  (payer 326: 264K members) ──────
+    # ORIGINAL ESTIMATE (2026-03-16):
+    #   Estimated files: 264K members × ~3 files = ~800K files.
+    #   chunk_size=3000 → ~88 chunks → ~9K files/chunk → ~5 min/chunk.
+    #
+    # ACTUAL OBSERVED (2026-03-17, first real run):
+    #   Actual files:    19,841,184  (~19.8M — payer 326 has ~75 files/member)
+    #   chunk_size=3000 → 89 chunks → ~223K files/chunk → ~3h 10m/chunk ← TOO SLOW
+    #   Root cause: each member has ~75 JSON files, not ~3.
+    #
+    # CORRECTED TUNING:
+    #   Target ~12,000 files/chunk (manageable for 100 G.2X workers in ~15 min).
+    #   New chunk_size = 12,000 ÷ 75 files/member ≈ 160 members/chunk.
+    #   Chunks = ceil(264,260 ÷ 160) = 1,652 chunks × ~15 min ≈ ~17h total.
+    #
+    #   To keep chunk time under 15 min with 100 G.2X workers:
+    #     files_per_partition=500: 12K files/chunk ÷ 500 = ~24 partitions
+    #     base_shuffle_partitions=400: 24 × 4 = 96, floored at 400
+    #     max_shuffle_partitions=2000: headroom for AQE on large partition skew
+    #
+    #   Glue timeout 1440 min (24h):  1,652 chunks × ~15 min worst-case = ~17h < 24h ✓
+    #   On re-run: checkpoints let job resume from last completed chunk automatically.
+    #
+    # USE THIS TIER when you know the payer has ~3 files/member (low-density):
+    "medium_250k": {
+        "member_chunk_size":        160,
+        "s3_list_workers":          150,
+        "base_shuffle_partitions":  400,
+        "files_per_partition":      500,
+        "max_shuffle_partitions":   2_000,
+        "iceberg_file_size_bytes":  256 * 1024 * 1024,
+        "cache_level_ser":          False,
+        "glue_worker_type":         "G.2X",
+        "glue_workers":             100,
+        "glue_timeout_min":         1_440,
+        "auto_optimize_full_load":  True,
+        "parallel_table_writes":    False,
+        "single_read_cache":        False,
+    },
+    # ── medium_250k_lowdensity ── ~800K files / ~300K members (~3 files/member) ──
+    # Use this for payers with ~3 files/member (the original medium_250k assumption).
+    # chunk_size=3000 members × 3 files = ~9K files/chunk → ~5 min/chunk.
+    # 88 chunks × 5 min = ~7.5h total.  Fits in 960 min timeout.
+    "medium_250k_lowdensity": {
+        "member_chunk_size":        3_000,
+        "s3_list_workers":          150,
+        "base_shuffle_partitions":  600,
+        "files_per_partition":      300,
+        "max_shuffle_partitions":   4_000,
+        "iceberg_file_size_bytes":  256 * 1024 * 1024,
+        "cache_level_ser":          False,
+        "glue_worker_type":         "G.2X",
+        "glue_workers":             100,
+        "glue_timeout_min":         960,
+        "auto_optimize_full_load":  True,
+        "parallel_table_writes":    False,
+        "single_read_cache":        False,
+    },
+    # ── payer326 ── OPTIMIZED for payer 326 actual profile (2026-03-17) ──────
+    #
+    # PROBLEM DIAGNOSIS (from actual chunk 1 log):
+    #   226,122 files → 754 partitions → ~300 files/task
+    #   Each task opens ~300 S3 HTTP connections ONE AT A TIME inside the JSON reader.
+    #   persist().count() alone took 3h 08m for 100 G.2X workers.
+    #   Total per chunk: ~3h 10m  →  89 chunks × 3h 10m = ~12 days.
+    #
+    # OPTIMIZATIONS APPLIED:
+    #
+    # 1. SINGLE S3 READ → 3 DFs from 1 cache  (biggest win: ~60% time reduction)
+    #    Currently: spark.read.json() called 3 times (claims + diagnosis + lines)
+    #               → 226K files read 3× from S3 = 678K S3 GET requests per chunk
+    #    Fix: read once → persist to cache → derive all 3 DFs from the SAME cache
+    #               → 226K S3 GET requests per chunk  (3× fewer S3 reads)
+    #    Config key: single_read_cache = True
+    #
+    # 2. PARALLEL ICEBERG WRITES  (~3× write speed)
+    #    Currently: claims → wait → claimdiagnosis → wait → claimlines  (sequential)
+    #    Fix: ThreadPoolExecutor(3) → all 3 writes run simultaneously
+    #    Config key: parallel_table_writes = True
+    #
+    # 3. 200 G.2X WORKERS  (2× parallelism vs 100)
+    #    Each G.2X = 8 vCPU, 32 GB RAM.
+    #    200 workers × 8 vCPU = 1,600 vCPUs available.
+    #    More S3 GET bandwidth and more concurrent Spark tasks.
+    #
+    # 4. CHUNK SIZE 2,000 members × 75 files = ~150,000 files/chunk
+    #    files_per_partition = 200 → 150K ÷ 200 = 750 partitions → ~200 files/task
+    #    (was 300 files/task — reducing task granularity cuts per-task S3 wait)
+    #    With 1,600 vCPUs: 750 partitions processed in ~0.5 passes → fast
+    #
+    # 5. SERIALISED CACHE (cache_level_ser = True)
+    #    At 150K files the cached raw_df is large — serialised storage halves
+    #    executor heap pressure, reducing GC pauses during the 3 DF derivations.
+    #
+    # EXPECTED PERFORMANCE:
+    #   Per chunk:
+    #     S3 read (150K files, 1600 vCPU, 750 partitions):  ~15 min  (was 3h 08m)
+    #     3 parallel Iceberg writes:                         ~3 min   (was 15 min seq)
+    #     Total per chunk:                                   ~18 min
+    #   Total:
+    #     ceil(264,260 ÷ 2000) = 133 chunks × 18 min = ~40h  ← still too slow
+    #
+    # FURTHER REDUCTION — raise workers to 200, lower chunk to 1000 members:
+    #   1000 × 75 = 75K files/chunk ÷ 200 files/partition = 375 partitions
+    #   With 1600 vCPU: 375 tasks in ~0.25 pass → ~8 min S3 read
+    #   Parallel writes: ~2 min
+    #   Total per chunk: ~10 min
+    #   ceil(264,260 ÷ 1000) = 265 chunks × 10 min = ~44h  ← still too slow
+    #
+    # THE REAL FIX — Use ALL 3 optimizations together:
+    #   single_read_cache=True cuts 3× S3 reads to 1× → 3h 08m → ~1h 03m
+    #   200 workers (2×) → ~32 min read
+    #   parallel_table_writes → saves ~10 min per chunk (3 seq writes → 1 parallel)
+    #   Final: ~32 min read + ~3 min write = ~35 min/chunk for 2000-member chunks
+    #   265 chunks × 35 min / 60 = ~9.5h  ✅ within 10-12h target
+    #
+    # Glue timeout: 1440 min (24h) — plenty of buffer for resume
+    "payer326": {
+        "member_chunk_size":        2_000,   # 2000 × 75 files = ~150K files/chunk
+        "s3_list_workers":          150,
+        "base_shuffle_partitions":  600,
+        "files_per_partition":      200,     # 150K ÷ 200 = 750 partitions → ~200 files/task
+        "max_shuffle_partitions":   4_000,
+        "iceberg_file_size_bytes":  512 * 1024 * 1024,   # 512 MB — fewer metadata files
+        "cache_level_ser":          True,    # serialised cache → less GC on large raw_df
+        "glue_worker_type":         "G.2X",
+        "glue_workers":             200,     # 200 × 8 vCPU = 1600 vCPUs
+        "glue_timeout_min":         1_440,   # 24h — 133 chunks × 35 min + buffer
+        "auto_optimize_full_load":  True,
+        "parallel_table_writes":    True,    # write claims+diagnosis+lines simultaneously
+        "single_read_cache":        True,    # read S3 files ONCE, derive 3 DFs from cache
+    },
+    # ── large_50m ── ~50M files / ~500K members ───────────────────────────────
     "large_50m": {
         "member_chunk_size":        3_000,
         "s3_list_workers":          200,
-        "base_shuffle_partitions":  4_000,
-        "files_per_partition":      50,
+        "base_shuffle_partitions":  1_000,
+        "files_per_partition":      500,
         "max_shuffle_partitions":   8_000,
-        "iceberg_file_size_bytes":  512 * 1024 * 1024,   # 512 MB
+        "iceberg_file_size_bytes":  512 * 1024 * 1024,
         "cache_level_ser":          True,
         "glue_worker_type":         "G.2X",
         "glue_workers":             200,
         "glue_timeout_min":         960,
         "auto_optimize_full_load":  True,
+        "parallel_table_writes":    True,
+        "single_read_cache":        True,
     },
 }
 
-SCALE_TIER  = args.get('scale_tier', 'small').lower()
+# SCALE_TIER is already parsed from sys.argv above via _get_optional_arg().
+# Validate here and fall back to 'small' if an unrecognised value was passed.
 if SCALE_TIER not in _SCALE_CONFIG:
     print(f"[WARN] Unknown scale_tier='{SCALE_TIER}' — falling back to 'small'")
     SCALE_TIER = 'small'
 _SC = _SCALE_CONFIG[SCALE_TIER]
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-SOURCE_BUCKET     = "nontrauma-claim-prod"
-TARGET_BUCKET     = "nontrauma-analytics-prod"
-DATABASE          = "claims_db_dev"
-PAYER_KEY         = "326"
-WATERMARK_KEY     = f"watermarks/claims_payer_{PAYER_KEY}_last_run.json"
-MEMBER_CHUNK_SIZE = _SC["member_chunk_size"]
-S3_LIST_WORKERS   = _SC["s3_list_workers"]
-FILES_PER_PART    = _SC["files_per_partition"]
-BASE_SHUFFLE_PART = _SC["base_shuffle_partitions"]
-MAX_SHUFFLE_PART  = _SC["max_shuffle_partitions"]
+# ── Derived constants from scale config ───────────────────────────────────────
+# SOURCE_BUCKET, TARGET_BUCKET, DATABASE, PAYER_KEY all come from job params above.
+# Watermark is per-payer so each payer's run is fully isolated.
+WATERMARK_KEY         = f"watermarks/claims_payer_{PAYER_KEY}_last_run.json"
+MEMBER_CHUNK_SIZE     = _SC["member_chunk_size"]
+S3_LIST_WORKERS       = _SC["s3_list_workers"]
+FILES_PER_PART        = _SC["files_per_partition"]
+BASE_SHUFFLE_PART     = _SC["base_shuffle_partitions"]
+MAX_SHUFFLE_PART      = _SC["max_shuffle_partitions"]
+PARALLEL_TABLE_WRITES = _SC.get("parallel_table_writes", False)
+SINGLE_READ_CACHE     = _SC.get("single_read_cache",     False)
 
 print(f"[INFO] ENV={ENV} | RUN={RUN}")
 print(f"[INFO] Source      → s3://{SOURCE_BUCKET}")
@@ -196,6 +467,12 @@ spark.conf.set("spark.sql.autoBroadcastJoinThreshold",                str(100 * 
 # Base shuffle partitions — AQE will coalesce down; dynamic override per chunk below
 spark.conf.set("spark.sql.shuffle.partitions",                        str(BASE_SHUFFLE_PART))
 spark.conf.set("spark.sql.legacy.timeParserPolicy",                   "CORRECTED")
+# Case-sensitive mode is REQUIRED so that explicit schemas with both
+# camelCase (Type 2) and PascalCase (Type 1) field names are treated as
+# distinct columns — e.g. "diagnosisCode" ≠ "DiagnosisCode".
+# Without this, Spark's default case-insensitive mode raises:
+#   AnalysisException: Found duplicate column(s) in the schema
+spark.conf.set("spark.sql.caseSensitive",                             "true")
 spark.conf.set("spark.sql.session.timeZone",                          "UTC")
 spark.conf.set("spark.sql.files.maxPartitionBytes",                   str(256 * 1024 * 1024))
 spark.conf.set("spark.sql.files.openCostInBytes",                     str(8   * 1024 * 1024))
@@ -205,10 +482,16 @@ spark.conf.set("spark.sql.iceberg.planning.preserve-data-grouping",   "true")
 # parameters --conf spark.serializer=org.apache.spark.serializer.KryoSerializer).
 # Setting it via sc._conf.set() AFTER SparkContext is running has NO effect.
 
-# Cache level: serialised at medium/large scale to halve executor heap pressure
-CACHE_LEVEL = (StorageLevel.MEMORY_AND_DISK_SER
-               if _SC["cache_level_ser"]
-               else StorageLevel.MEMORY_AND_DISK)
+# Cache level: serialised at medium/large scale to halve executor heap pressure.
+# NOTE: StorageLevel.MEMORY_AND_DISK_SER is a Scala-only constant — it does NOT
+# exist in PySpark's StorageLevel class and raises AttributeError at runtime.
+# The PySpark equivalent is constructed directly via the StorageLevel constructor:
+#   StorageLevel(useDisk, useMemory, useOffHeap, deserialized, replication)
+#   deserialized=False  → Java-serialised storage (lower heap pressure)
+#   deserialized=True   → raw object storage      (faster but more memory)
+_MEM_DISK_SER = StorageLevel(True, True, False, False, 1)   # MEMORY_AND_DISK_SER
+_MEM_DISK     = StorageLevel(True, True, False, True,  1)   # MEMORY_AND_DISK
+CACHE_LEVEL   = _MEM_DISK_SER if _SC["cache_level_ser"] else _MEM_DISK
 print("[INFO] Spark runtime configs set ✅")
 
 # ── Tracking variables ────────────────────────────────────────────────────────
@@ -217,7 +500,9 @@ filtered_count                 = 0
 is_full_load                   = True
 job_status                     = "STARTED"
 deleted_members                = set()
-current_member_claimkey_counts = {}   # saved to watermark for next run's delete detection
+reassigned_claims              = {}   # {src_member_key → set(claimkeys moved to another member)}
+current_member_claimkey_counts = {}   # {member_key → int}  saved to watermark
+current_member_claimkey_sets   = {}   # {member_key → [str]} saved to watermark for exact re-assignment detection next run
 s3_client                      = boto3.client("s3")
 glue_client          = boto3.client("glue")
 current_run_epoch_ms = int(datetime.utcnow().timestamp() * 1000)
@@ -282,7 +567,18 @@ def to_epoch_ms(col_ref):
     )
 
 def save_watermark(status, files_processed, records_merged, mode,
-                   members_deleted=0, member_claimkey_counts=None):
+                   members_deleted=0, member_claimkey_counts=None,
+                   member_claimkey_sets=None):
+    """
+    Save job watermark to S3.
+
+    member_claimkey_counts : {member_key → int}   — count of claimkeys per member
+    member_claimkey_sets   : {member_key → [str]} — ACTUAL claimkey list per member
+                             Used next run to detect EXACT re-assignments:
+                             if claimkey 555 was under m1 last run but is now
+                             under m2, we know precisely which key moved and can
+                             delete it from m1 in Iceberg before writing to m2.
+    """
     try:
         s3_client.put_object(
             Bucket=TARGET_BUCKET,
@@ -298,14 +594,169 @@ def save_watermark(status, files_processed, records_merged, mode,
                 "payer_key":               PAYER_KEY,
                 "env":                     ENV,
                 "run":                     RUN,
-                # Per-member claim key counts — used next run to detect
-                # partial deletes without reading Iceberg tables
+                # Per-member claim key counts — fast drop detection (count only)
                 "member_claimkey_counts":  member_claimkey_counts or {},
+                # Per-member actual claimkey sets — precise re-assignment detection
+                # {member_key_str → [claimkey_str, ...]}
+                # Allows next run to know EXACTLY which claimkeys moved between members
+                "member_claimkey_sets":    member_claimkey_sets or {},
             })
         )
         print(f"[WATERMARK] Saved → status={status} ✅")
     except Exception as wm_err:
         print(f"[WATERMARK] Failed to save watermark: {wm_err}")
+
+# ── Chunk-level resume checkpoint ─────────────────────────────────────────────
+# Purpose: if a FULL LOAD job fails mid-run (e.g. at chunk 45 of 88), the
+# next re-run can SKIP already-completed chunks instead of re-appending them
+# (which would cause duplicates) or deleting and restarting from scratch.
+#
+# How it works:
+#   • After every successful chunk write → save a tiny JSON to S3:
+#       checkpoints/claims_payer_{PAYER_KEY}_chunk_{idx}.json
+#   • On job start → scan that prefix; find the highest completed chunk index.
+#   • If checkpoint found → do NOT delete existing payer data; resume from
+#     the next chunk after the last completed one.
+#   • After ALL chunks complete successfully → delete all checkpoint files so
+#     a future re-run starts fresh (no stale checkpoints).
+#
+# Checkpoint key format:
+#   Full load  : checkpoints/fullload/claims_payer_326_chunk_0044.json
+#   Incremental: checkpoints/incremental/claims_payer_326_run_<epoch>/chunk_0044.json
+#
+# WHY SEPARATE PREFIXES:
+#   Full load     — only one active full load per payer at a time.
+#                   Checkpoint survives across re-runs until SUCCESS cleans it.
+#   Incremental   — each incremental run gets its OWN sub-folder keyed by the
+#                   run's epoch ms.  This means:
+#                   • A re-run of the SAME incremental attempt resumes correctly.
+#                   • A brand-new incremental run (new epoch) starts clean.
+#                   • Stale checkpoints from old incremental runs are deleted
+#                     automatically on SUCCESS.
+#
+# NOTE: current_run_epoch_ms is defined before this block in the tracking vars.
+
+_FL_CHECKPOINT_PREFIX   = f"checkpoints/fullload/claims_payer_{PAYER_KEY}_chunk_"
+# Incremental prefix is finalised after watermark read (needs is_full_load flag).
+# Stored in a list so STEP 2.5 can mutate it and _active_checkpoint_prefix()
+# always sees the updated value (Python closures capture the name, not the value,
+# but only for mutable containers — a plain string reassignment would NOT be
+# visible inside the function).
+_INCR_CHECKPOINT_FOLDER = [f"checkpoints/incremental/claims_payer_{PAYER_KEY}_run_{current_run_epoch_ms}/"]
+
+def _active_checkpoint_prefix(is_fl):
+    """Return the correct S3 prefix for this run's checkpoint files."""
+    return _FL_CHECKPOINT_PREFIX if is_fl else _INCR_CHECKPOINT_FOLDER[0] + "chunk_"
+
+def save_chunk_checkpoint(chunk_idx, chunk_count, cumulative_written, is_fl):
+    """
+    Save a per-chunk completion marker to S3 after a successful write.
+    Works for both FULL LOAD and INCREMENTAL runs.
+    Non-fatal: if S3 write fails the job continues; worst case is a re-run
+    starts from an earlier chunk.
+    """
+    key = f"{_active_checkpoint_prefix(is_fl)}{chunk_idx:04d}.json"
+    try:
+        s3_client.put_object(
+            Bucket=TARGET_BUCKET,
+            Key=key,
+            Body=json.dumps({
+                "payer_key":          PAYER_KEY,
+                "mode":               "FULL_LOAD" if is_fl else "INCREMENTAL",
+                "chunk_idx":          chunk_idx,
+                "chunk_count":        chunk_count,
+                "cumulative_written": cumulative_written,
+                "saved_at":           datetime.utcnow().isoformat(),
+            })
+        )
+        print(f"[CHECKPOINT] Chunk {chunk_idx} saved ✅  "
+              f"(cumulative: {cumulative_written})")
+    except Exception as cp_err:
+        print(f"[CHECKPOINT] WARN — failed to save chunk {chunk_idx}: {cp_err}")
+
+def load_chunk_checkpoint(is_fl):
+    """
+    Scan S3 for existing chunk checkpoints for this payer + run type.
+
+    FULL LOAD:
+      Scans _FL_CHECKPOINT_PREFIX — finds highest chunk_idx completed.
+      Returns that index so the loop can skip chunks 0..N.
+
+    INCREMENTAL:
+      Scans _INCR_CHECKPOINT_FOLDER — but ONLY if the folder matches the
+      CURRENT run epoch (same Glue job re-run after failure).
+      A brand-new incremental run always gets a new epoch → new folder →
+      no checkpoints found → starts from chunk 0.
+
+    Returns:
+      -1  → no checkpoint found, start from chunk 0
+       N  → chunks 0..N already written, resume from N+1
+    """
+    prefix = _active_checkpoint_prefix(is_fl)
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        completed = []
+        for page in paginator.paginate(
+            Bucket=TARGET_BUCKET,
+            Prefix=prefix,
+            PaginationConfig={"PageSize": 1000}
+        ):
+            for obj in page.get("Contents", []):
+                fname = obj["Key"].split("/")[-1]   # e.g. chunk_0044.json
+                part  = fname.replace(".json", "").split("chunk_")
+                if len(part) == 2 and part[1].isdigit():
+                    completed.append(int(part[1]))
+        if completed:
+            last = max(completed)
+            mode = "FULL LOAD" if is_fl else "INCREMENTAL"
+            print(f"[CHECKPOINT] [{mode}] Found {len(completed)} completed chunk(s). "
+                  f"Last completed index: {last}. Resuming from chunk {last + 1}.")
+            return last
+        print(f"[CHECKPOINT] No existing checkpoints — starting from chunk 0.")
+        return -1
+    except Exception as cp_err:
+        print(f"[CHECKPOINT] WARN — checkpoint scan failed: {cp_err}. "
+              f"Starting from chunk 0.")
+        return -1
+
+def delete_chunk_checkpoints(is_fl):
+    """
+    Delete ALL checkpoint files for this payer run from S3 after success.
+
+    FULL LOAD:   deletes everything under _FL_CHECKPOINT_PREFIX
+    INCREMENTAL: deletes only THIS run's folder (_INCR_CHECKPOINT_FOLDER)
+                 Old incremental run folders (from previous dates) are also
+                 cleaned up by scanning the parent prefix.
+    """
+    # For incremental, also clean up any leftover folders from past runs
+    if is_fl:
+        prefixes_to_clean = [_FL_CHECKPOINT_PREFIX]
+    else:
+        # Clean current run folder + any stale folders from previous incr runs
+        parent = f"checkpoints/incremental/claims_payer_{PAYER_KEY}_run_"
+        prefixes_to_clean = [parent]   # scanning parent cleans all sub-folders
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        keys_to_delete = []
+        for pfx in prefixes_to_clean:
+            for page in paginator.paginate(
+                Bucket=TARGET_BUCKET,
+                Prefix=pfx,
+                PaginationConfig={"PageSize": 1000}
+            ):
+                for obj in page.get("Contents", []):
+                    keys_to_delete.append({"Key": obj["Key"]})
+        if keys_to_delete:
+            for i in range(0, len(keys_to_delete), 1000):
+                s3_client.delete_objects(
+                    Bucket=TARGET_BUCKET,
+                    Delete={"Objects": keys_to_delete[i:i+1000]}
+                )
+            print(f"[CHECKPOINT] Deleted {len(keys_to_delete)} checkpoint file(s) ✅")
+        else:
+            print("[CHECKPOINT] No checkpoint files to delete.")
+    except Exception as cp_err:
+        print(f"[CHECKPOINT] WARN — checkpoint cleanup failed (non-fatal): {cp_err}")
 
 def _table_exists_glue(database, table_name):
     try:
@@ -323,10 +774,10 @@ def _table_exists_glue(database, table_name):
 _ICEBERG_FILE_SIZE = _SC["iceberg_file_size_bytes"]
 
 # Write strategy driven by scale tier:
-#   Full load  → copy-on-write (no delete-file accumulation on new tables)
+#   Full load  → copy-on-read (no delete-file accumulation on new tables)
 #   Incremental → merge-on-read (low write amplification for small upserts)
 # The DDL always creates tables with merge-on-read; an ALTER TABLE switches
-# to copy-on-write at the start of a full-load run and back afterwards.
+# to copy-on-read at the start of a full-load run and back afterwards.
 # (We use the same DDL for CREATE … so incremental increments stay MOR.)
 
 CLAIMS_DDL = f"""
@@ -614,8 +1065,30 @@ def _glue_drop_and_recreate(table_fqn, label):
     print(f"[WARN] {label}: table re-registered in Glue catalog ✅")
 
 def _iceberg_append(df, table_fqn, label):
-    df.writeTo(table_fqn).append()
-    print(f"[INFO] {label}: post-repair append ✅")
+    """
+    Append df to an Iceberg table.
+
+    Handles the NoSuchKeyException spiral that happens when:
+      - Glue catalog has the table entry  (CREATE TABLE ran previously)
+      - BUT the S3 Iceberg metadata was deleted  (manual cleanup / first run after wipe)
+      Iceberg calls loadTable → reads metadata JSON from S3 → 404 NoSuchKeyException.
+
+    Fix: catch NoSuchKeyException → drop stale Glue entry → re-CREATE table
+         (which writes a fresh metadata JSON to S3) → retry append once.
+    """
+    try:
+        df.writeTo(table_fqn).append()
+        print(f"[INFO] {label}: append ✅")
+    except Exception as e:
+        if not _is_nosuchkey(e):
+            raise
+        # Stale Glue catalog entry with no S3 metadata — repair and retry
+        print(f"[WARN] {label}: append → NoSuchKeyException "
+              f"(stale Glue entry / missing S3 metadata) — repairing...")
+        _glue_drop_and_recreate(table_fqn, label)
+        # After recreate, table is fresh — this append will succeed
+        df.writeTo(table_fqn).append()
+        print(f"[INFO] {label}: post-repair append ✅")
 
 def _safe_write(df, table_fqn, label, overwrite_partitions=True):
     """
@@ -748,6 +1221,59 @@ try:
         last_run_ts       = "1970-01-01T00:00:00"
         is_full_load      = True
 
+    # ── STEP 2.5 — RESOLVE INCREMENTAL RUN EPOCH FOR CHECKPOINT ─────────────
+    # For incremental resume to work correctly, a re-run of a FAILED incremental
+    # job must use the SAME checkpoint folder as the original failed attempt.
+    #
+    # Problem: current_run_epoch_ms is always NOW (different on every Glue start).
+    # So a re-run would create a NEW checkpoint folder → no checkpoints found →
+    # starts from chunk 0 → all previous chunks re-processed (safe but slow).
+    #
+    # Solution: persist the incremental run epoch to S3 on first start.
+    #   Key: checkpoints/incremental/claims_payer_{PAYER_KEY}_active_run.json
+    #   • First start of an incremental run → write this file with current epoch.
+    #   • Re-run (same failed job) → read this file → use the SAME epoch →
+    #     finds the original checkpoint folder → resumes correctly.
+    #   • On SUCCESS → delete this file along with the checkpoint folder.
+    #
+    # Full load runs do NOT need this (their checkpoint prefix is epoch-free).
+    _INCR_ACTIVE_RUN_KEY = (
+        f"checkpoints/incremental/claims_payer_{PAYER_KEY}_active_run.json"
+    )
+    if not is_full_load:
+        try:
+            _ar_obj  = s3_client.get_object(Bucket=TARGET_BUCKET, Key=_INCR_ACTIVE_RUN_KEY)
+            _ar_data = json.loads(_ar_obj["Body"].read())
+            _active_epoch = int(_ar_data["run_epoch_ms"])
+            print(f"[CHECKPOINT] Incremental active-run epoch loaded: {_active_epoch} "
+                  f"(original start: {_ar_data.get('started_at', 'unknown')})")
+        except s3_client.exceptions.NoSuchKey:
+            # First start of this incremental run — write the epoch marker
+            _active_epoch = current_run_epoch_ms
+            try:
+                s3_client.put_object(
+                    Bucket=TARGET_BUCKET,
+                    Key=_INCR_ACTIVE_RUN_KEY,
+                    Body=json.dumps({
+                        "payer_key":     PAYER_KEY,
+                        "run_epoch_ms":  _active_epoch,
+                        "started_at":    current_run_ts,
+                    })
+                )
+                print(f"[CHECKPOINT] Incremental active-run epoch saved: {_active_epoch}")
+            except Exception as _ae:
+                print(f"[CHECKPOINT] WARN — could not save active-run epoch: {_ae}")
+        except Exception as _ae:
+            _active_epoch = current_run_epoch_ms
+            print(f"[CHECKPOINT] WARN — active-run read failed: {_ae}. "
+                  f"Using current epoch (re-run will start from chunk 0).")
+        # Update the incremental checkpoint folder to use the resolved epoch
+        _INCR_CHECKPOINT_FOLDER[0] = (
+            f"checkpoints/incremental/claims_payer_{PAYER_KEY}_run_{_active_epoch}/"
+        )
+    else:
+        _INCR_ACTIVE_RUN_KEY = None   # not used for full load
+
     # ── STEP 3 — FIND CHANGED FILES ───────────────────────────────────────────
     print(f"[STEP 3] Scanning S3 for changed files — PAYER={PAYER_KEY}...")
     try:
@@ -767,6 +1293,14 @@ try:
         members_found     = set()
         total_scanned     = 0
 
+        # S3 LIST retry constants
+        # At large_50m (200 threads) the S3 LIST API can return SlowDown (503).
+        # Without retry the exception kills the thread → that member's files are
+        # silently MISSING from changed_files → data never written to Iceberg.
+        # Exponential backoff: 1 s → 2 s → 4 s → 8 s → 16 s (5 attempts total).
+        _S3_LIST_MAX_RETRIES = 5
+        _S3_LIST_BASE_DELAY  = 1.0   # seconds
+
         def _list_member(prefix):
             """
             Scan one member prefix and return:
@@ -775,64 +1309,115 @@ try:
                                  (used to detect partial/full deletes)
               has_any_json     — whether ANY json still exists for this member
               member_key       — the member id string
+
+            Retries up to _S3_LIST_MAX_RETRIES times with exponential backoff
+            on S3 SlowDown (503) / throttling errors so that high worker counts
+            (150–200 threads at medium/large scale) don't silently drop members.
             """
-            changed_results  = []
-            all_s3_claimkeys = set()   # every claimkey file currently on S3
-            has_any_json     = False
-            pager            = s3_client.get_paginator("list_objects_v2")
-            for pg in pager.paginate(Bucket=SOURCE_BUCKET, Prefix=prefix,
-                                     PaginationConfig={"PageSize": 1000}):
-                for obj in pg.get("Contents", []):
-                    key = obj["Key"]
-                    if not key.endswith(".json"):
-                        continue
-                    has_any_json = True
-                    parts = key.split("/")
-                    if len(parts) < 3:
-                        continue
-                    claim_key_str = parts[2].replace(".json", "")
-                    all_s3_claimkeys.add(claim_key_str)
-                    file_epoch_ms = int(obj["LastModified"].timestamp() * 1000)
-                    if file_epoch_ms > last_run_epoch_ms:
-                        changed_results.append({
-                            "s3_path":         f"s3://{SOURCE_BUCKET}/{key}",
-                            "path_payer_key":  parts[0],
-                            "path_member_key": parts[1],
-                            "path_claim_key":  claim_key_str,
-                            "file_epoch_ms":   file_epoch_ms,
-                        })
+            import time as _time
+            import botocore.exceptions as _bce
+
             member_key = prefix.rstrip("/").split("/")[-1]
-            return changed_results, all_s3_claimkeys, has_any_json, member_key
+
+            for attempt in range(1, _S3_LIST_MAX_RETRIES + 1):
+                try:
+                    changed_results  = []
+                    all_s3_claimkeys = set()
+                    has_any_json     = False
+                    pager            = s3_client.get_paginator("list_objects_v2")
+                    for pg in pager.paginate(Bucket=SOURCE_BUCKET, Prefix=prefix,
+                                             PaginationConfig={"PageSize": 1000}):
+                        for obj in pg.get("Contents", []):
+                            key = obj["Key"]
+                            if not key.endswith(".json"):
+                                continue
+                            has_any_json = True
+                            parts = key.split("/")
+                            if len(parts) < 3:
+                                continue
+                            claim_key_str = parts[2].replace(".json", "")
+                            all_s3_claimkeys.add(claim_key_str)
+                            file_epoch_ms = int(obj["LastModified"].timestamp() * 1000)
+                            if file_epoch_ms > last_run_epoch_ms:
+                                changed_results.append({
+                                    "s3_path":         f"s3://{SOURCE_BUCKET}/{key}",
+                                    "path_payer_key":  parts[0],
+                                    "path_member_key": parts[1],
+                                    "path_claim_key":  claim_key_str,
+                                    "file_epoch_ms":   file_epoch_ms,
+                                })
+                    return changed_results, all_s3_claimkeys, has_any_json, member_key
+
+                except _bce.ClientError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    # Retry only on throttling / slow-down responses
+                    if code in ("SlowDown", "503", "Throttling",
+                                "RequestLimitExceeded", "ServiceUnavailable"):
+                        if attempt < _S3_LIST_MAX_RETRIES:
+                            delay = _S3_LIST_BASE_DELAY * (2 ** (attempt - 1))
+                            print(f"[WARN] _list_member({member_key}): "
+                                  f"S3 throttle [{code}] attempt {attempt}/"
+                                  f"{_S3_LIST_MAX_RETRIES} — retrying in {delay:.1f}s")
+                            _time.sleep(delay)
+                            continue
+                    # Non-throttle error OR exhausted retries → raise so the
+                    # future resolves as an exception (caught in as_completed loop)
+                    raise
+
+            # Should never reach here, but satisfies linters
+            raise RuntimeError(
+                f"_list_member({member_key}): exhausted {_S3_LIST_MAX_RETRIES} retries"
+            )
 
         # deleted_members     — member has ZERO json files left on S3
-        # partially_deleted   — member still has SOME files but the watermark
-        #                       recorded more claim keys last run (net deletion)
+        # partially_deleted   — member still has SOME files but fewer claimkeys
+        # reassigned_claims   — {m1 → set(claimkeys moved away from m1)}
+        #                       claimkey was under m1 last run, now missing from m1
+        #                       but will appear under a different member (m2) this run
+        #                       → must DELETE from m1 in Iceberg, write under m2
         # member_s3_claimkeys — {member_key → frozenset(claimkeys on S3 NOW)}
-        #                       stored ONLY for members with changed/deleted files
-        #                       NOT for every member — keeps driver memory bounded
+        #                       stored for members with dropped count
         deleted_members     = set()
         partially_deleted   = set()
         member_s3_claimkeys = {}
+        reassigned_claims   = {}   # {member_key_str → set(claimkey_str)}
 
-        # Load per-member claim-key counts from the last-run watermark (if any).
-        # This lets us detect partial deletes without reading Iceberg at all:
-        # if S3 now has fewer claim keys than last run recorded, some were deleted.
-        last_member_claimkey_counts = {}   # member_key → int count from watermark
+        # Load per-member data from the last-run watermark (if any).
+        last_member_claimkey_counts = {}   # member_key → int count
+        last_member_claimkey_sets   = {}   # member_key → set(claimkey_str)
         if not is_full_load:
             try:
                 wm_obj = s3_client.get_object(Bucket=TARGET_BUCKET, Key=WATERMARK_KEY)
                 wm     = json.loads(wm_obj["Body"].read())
                 last_member_claimkey_counts = wm.get("member_claimkey_counts", {})
+                # Convert lists back to sets (JSON serialises sets as lists)
+                last_member_claimkey_sets = {
+                    mk: set(ck_list)
+                    for mk, ck_list in wm.get("member_claimkey_sets", {}).items()
+                }
             except Exception:
-                pass   # watermark missing or old format — treat all as no prior count
+                pass   # watermark missing or old format — treat all as no prior data
 
-        # Current-run per-member claim key counts — saved to watermark at end
+        # Current-run per-member claimkey tracking — both count AND sets
         current_member_claimkey_counts = {}
+        current_member_claimkey_sets   = {}   # stored for all members this run
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=S3_LIST_WORKERS) as pool:
             futures = {pool.submit(_list_member, pfx): pfx for pfx in member_prefixes}
+            failed_prefixes = []
             for future in concurrent.futures.as_completed(futures):
-                batch, all_s3_claimkeys, has_any_json, member_key = future.result()
+                pfx = futures[future]
+                try:
+                    batch, all_s3_claimkeys, has_any_json, member_key = future.result()
+                except Exception as list_err:
+                    # After all retries exhausted, log and continue.
+                    # The member is skipped this run — watermark is NOT updated
+                    # (job_status stays non-SUCCESS) so a re-run will retry it.
+                    failed_prefixes.append(pfx)
+                    print(f"[ERROR] _list_member({pfx}): failed after all retries: "
+                          f"{list_err} — member will be retried on next run")
+                    continue
+
                 for rec in batch:
                     total_scanned += 1
                     changed_file_meta.append(rec)
@@ -841,22 +1426,44 @@ try:
                 if not is_full_load:
                     s3_count   = len(all_s3_claimkeys)
                     last_count = last_member_claimkey_counts.get(member_key, None)
+                    last_keys  = last_member_claimkey_sets.get(member_key, set())
 
-                    # Always record current count for next run's watermark
+                    # Always record current count AND set for next run's watermark
                     current_member_claimkey_counts[member_key] = s3_count
+                    current_member_claimkey_sets[member_key]   = list(all_s3_claimkeys)
 
                     if not has_any_json:
-                        # ALL files deleted
+                        # ALL files deleted — full member purge
                         deleted_members.add(member_key)
-                        # Store empty set so STEP 3.5-A can skip claimkey lookup
                         member_s3_claimkeys[member_key] = frozenset()
 
                     elif last_count is not None and s3_count < last_count:
-                        # Fewer claim files on S3 than last run → partial delete
-                        # Only store claimkeys for these members (not all members)
+                        # Fewer claimkeys on S3 than last run → some were removed.
+                        # Could be: pure delete OR re-assignment to another member.
+                        # Either way STEP 3.5-B will keep only surviving keys.
                         partially_deleted.add(member_key)
                         member_s3_claimkeys[member_key] = frozenset(all_s3_claimkeys)
-                    # else: member count unchanged or grew → no delete tracking needed
+
+                        # Detect EXACT re-assigned claimkeys:
+                        # keys present last run under this member but now gone from S3.
+                        # These keys may re-appear under a different member (m2).
+                        if last_keys:
+                            moved_keys = last_keys - all_s3_claimkeys
+                            if moved_keys:
+                                reassigned_claims[member_key] = moved_keys
+                                print(f"[STEP 3] Re-assignment detected: "
+                                      f"member {member_key} lost "
+                                      f"{len(moved_keys)} claimkey(s) "
+                                      f"→ will purge from Iceberg before "
+                                      f"writing to destination member")
+
+            # If ANY member prefix failed to list, raise so job_status = FAILED
+            # and watermark is NOT updated — guaranteeing a full re-scan on rerun.
+            if failed_prefixes:
+                raise Exception(
+                    f"[STEP 3] {len(failed_prefixes)} member prefix(es) failed S3 LIST "
+                    f"after {_S3_LIST_MAX_RETRIES} retries: {failed_prefixes[:10]}"
+                )
 
         # Build the flat list once after all threads finish
         changed_files = [r["s3_path"] for r in changed_file_meta]
@@ -871,6 +1478,12 @@ try:
             print(f"[STEP 3] Partially-changed members : "
                   f"{len(partially_deleted - deleted_members)} "
                   f"(some claims deleted/moved from S3)")
+        if reassigned_claims:
+            total_moved = sum(len(v) for v in reassigned_claims.values())
+            print(f"[STEP 3] Re-assigned claimkeys     : {total_moved} key(s) "
+                  f"across {len(reassigned_claims)} source member(s) "
+                  f"(moved to a different member — will delete from source, "
+                  f"write to destination)")
         if changed_files:
             for f in changed_files[:5]:
                 print(f"         {f}")
@@ -882,7 +1495,9 @@ try:
 
     if not changed_files and not deleted_members:
         print("[STEP 3] No new, modified, or deleted files — nothing to do!")
-        save_watermark("SUCCESS - NO CHANGES", 0, 0, "INCREMENTAL - NO CHANGES")
+        save_watermark("SUCCESS - NO CHANGES", 0, 0, "INCREMENTAL - NO CHANGES",
+                       member_claimkey_counts = current_member_claimkey_counts,
+                       member_claimkey_sets   = current_member_claimkey_sets)
         job.commit()
         sys.exit(0)
 
@@ -1023,12 +1638,129 @@ try:
 
         print(f"[STEP 3.5] Delete sync complete ✅")
 
+    # ── STEP 3.5-C — CLAIM RE-ASSIGNMENT: delete moved claimkeys from source member ──
+    #
+    # Scenario:  m1 had 10 claims (claimkeys 1-10).
+    #            An upstream update moves claims 3,4,5 from m1 → m2.
+    #            S3 now has:  m1/ → files for claimkeys 1,2,6,7,8,9,10
+    #                         m2/ → files for claimkeys 3,4,5  (new/updated)
+    #
+    # Without this step:
+    #   • STEP 3.5-B removes claimkeys 3,4,5 from m1 in Iceberg ✅ (count dropped)
+    #   • Chunk loop writes claimkeys 3,4,5 under m2 in Iceberg ✅
+    #   → Both steps already work via partially_deleted + the chunk write.
+    #
+    # BUT — there is one edge case this step handles that STEP 3.5-B misses:
+    #   If m1's remaining files (1,2,6-10) have NOT changed since last run
+    #   (same S3 epoch), m1 will NOT appear in changed_files, so m1's chunk
+    #   is NOT processed in the main loop.  STEP 3.5-B DOES handle this via
+    #   the count-drop detection → partial delete reconciliation.
+    #
+    # This step (3.5-C) adds an EXPLICIT log + guardrail for re-assignments
+    # detected via the claimkey-set diff (last_keys - current_keys) so that:
+    #   1. The purge is logged clearly as "re-assignment" not "partial delete"
+    #   2. Even if STEP 3.5-B is skipped (e.g. count logic edge case), the
+    #      specific moved claimkeys are guaranteed to be purged from m1.
+    #
+    # NOTE: reassigned_claims is populated ONLY in incremental runs when
+    # last_member_claimkey_sets is available from the watermark.
+    if not is_full_load and reassigned_claims:
+        print(f"[STEP 3.5-C] Processing {len(reassigned_claims)} re-assignment(s) — "
+              f"purging moved claimkeys from source members in Iceberg...")
+
+        # Build (payerkey, memberkey, claimkey) rows to DELETE from Iceberg
+        # These are rows that WERE under m1 but have now moved to m2
+        reassign_delete_rows = [
+            (int(PAYER_KEY), int(src_member), int(ck))
+            for src_member, ck_set in reassigned_claims.items()
+            if src_member.isdigit()
+            for ck in ck_set if ck.isdigit()
+        ]
+        # Also build (payerkey, memberkey) for source members that had moves
+        reassign_member_rows = [
+            (int(PAYER_KEY), int(src_member))
+            for src_member in reassigned_claims
+            if src_member.isdigit()
+        ]
+
+        if reassign_delete_rows and reassign_member_rows:
+            moved_keys_df   = spark.createDataFrame(
+                reassign_delete_rows,
+                ["payerkey_mv", "memberkey_mv", "claimkey_mv"]
+            )
+            src_members_df  = spark.createDataFrame(
+                reassign_member_rows,
+                ["payerkey_sm", "memberkey_sm"]
+            )
+
+            for tbl_name, tbl_fqn in [
+                ("claims",         f"glue_catalog.{DATABASE}.claims"),
+                ("claimdiagnosis", f"glue_catalog.{DATABASE}.claimdiagnosis"),
+                ("claimlines",     f"glue_catalog.{DATABASE}.claimlines"),
+            ]:
+                try:
+                    if not _table_exists_glue(DATABASE, tbl_name):
+                        continue
+                    if not _iceberg_metadata_exists(tbl_name):
+                        continue
+
+                    # Read only the payerkey partition — NOT a full table scan
+                    tbl_scoped = (
+                        spark.table(tbl_fqn)
+                        .filter(F.col("payerkey") == int(PAYER_KEY))
+                    )
+
+                    # Rows NOT in any source (re-assigning) member → untouched
+                    unaffected = tbl_scoped.join(
+                        F.broadcast(src_members_df),
+                        on=(
+                            (F.col("payerkey")  == F.col("payerkey_sm")) &
+                            (F.col("memberkey") == F.col("memberkey_sm"))
+                        ),
+                        how="left_anti"
+                    )
+
+                    # Rows IN source members but claimkey NOT in the moved set → keep
+                    # (these are the claims that stayed with m1)
+                    still_at_source = tbl_scoped.join(
+                        F.broadcast(src_members_df),
+                        on=(
+                            (F.col("payerkey")  == F.col("payerkey_sm")) &
+                            (F.col("memberkey") == F.col("memberkey_sm"))
+                        ),
+                        how="inner"
+                    ).join(
+                        F.broadcast(moved_keys_df),
+                        on=(
+                            (F.col("payerkey")  == F.col("payerkey_mv")) &
+                            (F.col("memberkey") == F.col("memberkey_mv")) &
+                            (F.col("claimkey")  == F.col("claimkey_mv"))
+                        ),
+                        how="left_anti"   # keep rows whose claimkey did NOT move
+                    ).drop("payerkey_sm", "memberkey_sm")
+
+                    reconciled = unaffected.unionByName(still_at_source)
+                    _safe_write(reconciled, tbl_fqn,
+                                f"{tbl_name}(reassignment-purge)")
+                    purged = len(reassign_delete_rows)
+                    print(f"[STEP 3.5-C] {tbl_name}: "
+                          f"{purged} re-assigned claimkey row(s) purged from "
+                          f"source member(s) ✅")
+                except Exception as e:
+                    print(f"[STEP 3.5-C] WARN {tbl_name}: "
+                          f"re-assignment purge failed (non-fatal): {e}")
+
+        print(f"[STEP 3.5-C] Re-assignment purge complete ✅  "
+              f"Destination member(s) will receive the moved claims "
+              f"via the normal chunk write in STEP 4–10.")
+
     if not changed_files:
         print("[STEP 3.5] Only deletions this run — no new files to process.")
         save_watermark("SUCCESS - DELETIONS ONLY",
                        len(deleted_members), 0, "INCREMENTAL - DELETIONS ONLY",
                        members_deleted        = len(deleted_members),
-                       member_claimkey_counts = current_member_claimkey_counts)
+                       member_claimkey_counts = current_member_claimkey_counts,
+                       member_claimkey_sets   = current_member_claimkey_sets)
         job.commit()
         sys.exit(0)
 
@@ -1089,6 +1821,151 @@ try:
         _table_meta_ok[_tbl]       = _iceberg_metadata_exists(_tbl)
         _table_use_overwrite[_tbl] = _table_meta_ok[_tbl]
 
+    # ── FULL LOAD: pre-loop table preparation ────────────────────────────────
+    # Three scenarios handled before chunk 1 ever runs:
+    #
+    # Scenario A — S3 was wiped but Glue catalog entry still exists
+    #   Symptom : _table_meta_ok = False  (no metadata/ files on S3)
+    #   Fix     : drop stale Glue entry + recreate table fresh
+    #   Result  : first append() writes to a clean empty Iceberg table
+    #
+    # Scenario B — Job failed mid-run last time (e.g. crashed after chunk 3/20)
+    #   Symptom : _table_meta_ok = True AND payerkey={PAYER_KEY} data files exist
+    #   Fix     : DELETE all rows for this payer  (Iceberg partition prune → fast)
+    #   Result  : clean slate → re-run appends all chunks from scratch, no dupes
+    #   NOTE    : watermark is NOT written on failure, so is_full_load stays True
+    #             on re-run — this block always fires before the chunk loop.
+    #
+    # Scenario B-new — First time this payer ever runs on an existing table
+    #   Symptom : _table_meta_ok = True AND NO payerkey={PAYER_KEY} data files
+    #   Fix     : nothing — just start appending
+    #
+    # Scenario C — Table does not exist at all
+    #   Handled by STEP 10 CREATE TABLE above — nothing to do here
+    if is_full_load:
+        print(f"[INFO] Full load — preparing tables for payer {PAYER_KEY}...")
+        # Check checkpoint ONCE here — reused for all 3 tables below.
+        # Avoids 3 separate S3 LIST calls (one per table loop iteration).
+        _fl_cp_check = load_chunk_checkpoint(True)
+        for _tbl in ["claims", "claimdiagnosis", "claimlines"]:
+            _tbl_fqn = f"glue_catalog.{DATABASE}.{_tbl}"
+
+            if _table_exists_glue(DATABASE, _tbl) and not _table_meta_ok[_tbl]:
+                # Scenario A: Glue entry exists but S3 metadata was wiped
+                print(f"[WARN] {_tbl}: Glue entry exists but S3 metadata is missing "
+                      f"(S3 was wiped) — dropping stale entry and recreating...")
+                _glue_drop_and_recreate(_tbl_fqn, _tbl)
+                print(f"[INFO] {_tbl}: recreated fresh ✅")
+
+            elif _table_exists_glue(DATABASE, _tbl) and _table_meta_ok[_tbl]:
+                payer_prefix = f"iceberg/{_tbl}/data/payerkey={PAYER_KEY}/"
+                payer_data   = s3_client.list_objects_v2(
+                    Bucket=TARGET_BUCKET, Prefix=payer_prefix, MaxKeys=1
+                )
+                if payer_data.get("KeyCount", 0) > 0:
+                    # Scenario B: partial data exists — check cached checkpoint
+                    if _fl_cp_check >= 0:
+                        print(f"[INFO] {_tbl}: checkpoint found at chunk {_fl_cp_check} "
+                              f"— keeping existing data, will resume from chunk "
+                              f"{_fl_cp_check + 1} ✅")
+                    else:
+                        print(f"[INFO] {_tbl}: found existing data for payerkey={PAYER_KEY} "
+                              f"(failed re-run, no checkpoint) — deleting to start clean...")
+                        try:
+                            spark.sql(f"""
+                                DELETE FROM {_tbl_fqn}
+                                WHERE payerkey = {int(PAYER_KEY)}
+                            """)
+                            print(f"[INFO] {_tbl}: payerkey={PAYER_KEY} cleared ✅")
+                        except Exception as _del_err:
+                            print(f"[WARN] {_tbl}: DELETE failed — "
+                                  f"may cause duplicates on re-run: {_del_err}")
+                else:
+                    print(f"[INFO] {_tbl}: no existing data for "
+                          f"payerkey={PAYER_KEY} — clean start ✅")
+            else:
+                print(f"[INFO] {_tbl}: does not exist in Glue — "
+                      f"will be created on first write ✅")
+
+    # ── Resume checkpoint: determine which chunk to start from ───────────────
+    # Full load  : reuse _fl_cp_check already loaded above (avoid 2nd S3 LIST)
+    # Incremental: load now (first time checkpoint is checked for incremental)
+    if is_full_load:
+        resume_from_chunk = _fl_cp_check
+    else:
+        resume_from_chunk = load_chunk_checkpoint(False)
+
+    if resume_from_chunk >= 0:
+        mode_label = "FULL LOAD" if is_full_load else "INCREMENTAL"
+        print(f"[CHECKPOINT] [{mode_label}] RESUMING from chunk "
+              f"{resume_from_chunk + 1} — "
+              f"chunks 0–{resume_from_chunk} already written.")
+        if is_full_load:
+            print(f"[CHECKPOINT] Existing payer data preserved — "
+                  f"skipping pre-loop DELETE.")
+
+        # ── PARTIAL-WRITE SAFETY: purge the first un-checkpointed chunk ───────
+        # Scenario: job was stopped (manually or by timeout) WHILE chunk N+1 was
+        # being written.  One or more of the 3 table appends may have completed
+        # before the stop.  Since there is no checkpoint for chunk N+1, the
+        # re-run will process and append it again → DUPLICATE rows for those members.
+        #
+        # Fix: before the chunk loop, DELETE from Iceberg every memberkey that
+        # belongs to the FIRST chunk we are about to re-process (resume_from_chunk+1).
+        # This is a fast operation: Iceberg prunes to (payerkey, loadyear, loadmonth)
+        # partitions and the broadcast anti-join removes only the affected members.
+        # Chunks 0..resume_from_chunk are NOT touched (their data is correct).
+        #
+        # This handles:
+        #   • Manual stop mid-chunk  (your scenario)
+        #   • Glue timeout mid-chunk
+        #   • OOM / executor failure mid-chunk
+        #   Any case where the job dies without saving a checkpoint for that chunk.
+        _next_chunk_idx     = resume_from_chunk + 1
+        _next_chunk_members = all_members[
+            _next_chunk_idx * MEMBER_CHUNK_SIZE :
+            (_next_chunk_idx + 1) * MEMBER_CHUNK_SIZE
+        ]
+        if _next_chunk_members and is_full_load:
+            print(f"[CHECKPOINT] Purging partial-write safety: "
+                  f"deleting any data for chunk {_next_chunk_idx + 1} members "
+                  f"({len(_next_chunk_members)} members) before resuming...")
+            try:
+                _purge_member_rows = [
+                    (int(PAYER_KEY), int(m))
+                    for m in _next_chunk_members if str(m).isdigit()
+                ]
+                if _purge_member_rows:
+                    _purge_df = spark.createDataFrame(
+                        _purge_member_rows, ["payerkey_pu", "memberkey_pu"]
+                    )
+                    for _pu_tbl in ["claims", "claimdiagnosis", "claimlines"]:
+                        _pu_fqn = f"glue_catalog.{DATABASE}.{_pu_tbl}"
+                        if not _table_exists_glue(DATABASE, _pu_tbl):
+                            continue
+                        if not _table_meta_ok.get(_pu_tbl, False):
+                            continue
+                        _pu_existing = spark.table(_pu_fqn).filter(
+                            F.col("payerkey") == int(PAYER_KEY)
+                        )
+                        _pu_clean = _pu_existing.join(
+                            F.broadcast(_purge_df),
+                            on=(
+                                (F.col("payerkey")  == F.col("payerkey_pu")) &
+                                (F.col("memberkey") == F.col("memberkey_pu"))
+                            ),
+                            how="left_anti"
+                        )
+                        _safe_write(_pu_clean, _pu_fqn,
+                                    f"{_pu_tbl}(partial-write-purge)")
+                        print(f"[CHECKPOINT] {_pu_tbl}: "
+                              f"chunk {_next_chunk_idx + 1} members purged "
+                              f"(partial-write safety) ✅")
+            except Exception as _pu_err:
+                print(f"[CHECKPOINT] WARN — partial-write purge failed "
+                      f"(non-fatal, may cause duplicates for chunk "
+                      f"{_next_chunk_idx + 1}): {_pu_err}")
+
     # ── FULL LOAD: switch Iceberg to copy-on-write before writing ─────────────
     # copy-on-write produces clean data files with no delete-file accumulation,
     # which is ideal for a brand-new full load at 10 M / 50 M scale.
@@ -1100,6 +1977,9 @@ try:
 
     print(f"[STEP 4] {len(all_members)} unique members → "
           f"{num_chunks} chunks of ≤{MEMBER_CHUNK_SIZE} members each")
+    if resume_from_chunk >= 0:
+        print(f"[STEP 4] ⏭  Skipping chunks 0–{resume_from_chunk} "
+              f"(already written in previous run)")
 
     for chunk_idx in range(num_chunks):
         chunk_members = all_members[
@@ -1108,18 +1988,31 @@ try:
         chunk_meta = [rec for m in chunk_members for rec in member_to_files[m]]
         chunk_files = [r["s3_path"] for r in chunk_meta]
 
+        # ── Resume: skip chunks already written in a previous failed run ──
+        if chunk_idx <= resume_from_chunk:
+            mode_lbl = "FULL LOAD" if is_full_load else "INCREMENTAL"
+            print(f"[CHUNK {chunk_idx+1}/{num_chunks}] ⏭  SKIPPED "
+                  f"[{mode_lbl}] (checkpoint {chunk_idx} already written)")
+            continue
+
         print(f"\n[CHUNK {chunk_idx+1}/{num_chunks}] "
               f"{len(chunk_members)} members | {len(chunk_files)} files")
 
-        # ── Dynamic shuffle partitions for this chunk ──────────────────────
-        # Formula: ceil(files / FILES_PER_PART) * 4, clamped to [BASE, MAX].
-        # Prevents under-partitioning on large chunks (50 K files at 50 M scale).
+        # ── Partition + shuffle sizing — pure Python, zero Spark actions ─────────
+        # ideal_partitions: target partition count after repartition().
+        #   small example   : 3000 files / 50  files_per_partition = 60 partitions
+        #   medium_10m ex.  : 9446 files / 200 files_per_partition = 48 partitions
+        ideal_partitions = max(4, -(-len(chunk_files) // FILES_PER_PART))
+
+        # chunk_shuffle_parts: AQE coalesces down; this just sets the ceiling.
+        #   ideal_partitions × 4 gives AQE headroom without 1600-task overhead.
         chunk_shuffle_parts = max(
             BASE_SHUFFLE_PART,
-            min(MAX_SHUFFLE_PART,
-                (-(-len(chunk_files) // FILES_PER_PART)) * 4)
+            min(MAX_SHUFFLE_PART, ideal_partitions * 4)
         )
         spark.conf.set("spark.sql.shuffle.partitions", str(chunk_shuffle_parts))
+        print(f"[CHUNK {chunk_idx+1}] partitions={ideal_partitions}  "
+              f"shuffle={chunk_shuffle_parts}")
 
         raw_df = None
         try:
@@ -1143,12 +2036,28 @@ try:
             epoch_rows = [(path, epoch) for path, epoch in epoch_map.items()]
             epoch_df = spark.createDataFrame(epoch_rows, ["s3_path_key", "file_epoch_ms_actual"])
 
-            raw_df = (
+            _json_df = (
                 spark.read
                 .option("multiline",           "true")
                 .option("mode",                "PERMISSIVE")
                 .option("recursiveFileLookup", "false")
                 .json(chunk_files)             # ← exact paths, no glob expansion
+            )
+            # Drop any JSON fields that collide with our system column names
+            # before we add them via withColumn. Spark's withColumn does NOT
+            # replace an existing column — it appends a second one with the
+            # same name, which later causes "Found duplicate column(s)" in
+            # dropDuplicates / writes.
+            _sys_cols = ["path_payer_key", "path_member_key", "path_claim_key",
+                         "_s3_path", "file_epoch_ms",
+                         "resolved_payer_key", "resolved_member_key", "resolved_claim_key",
+                         "updated_at_epoch_ms", "claim_load_ts", "loadyear", "loadmonth"]
+            for _sc in _sys_cols:
+                if _sc in _json_df.columns:
+                    _json_df = _json_df.drop(_sc)
+
+            raw_df = (
+                _json_df
                 # path keys
                 .withColumn("path_payer_key",
                     F.element_at(path_parts, -3).cast("long"))
@@ -1168,24 +2077,49 @@ try:
                 .drop("_s3_path", "s3_path_key", "file_epoch_ms_actual")
                 # resolved keys & epoch
                 .withColumn("resolved_payer_key",
-                    F.coalesce(F.col("payerKey").cast("long"),
-                               F.col("path_payer_key")))
+                    F.coalesce(
+                        F.col("payerKey").cast("long")    # Type 2 camelCase
+                            if "payerKey"  in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("PayerKey").cast("long")    # Type 1 PascalCase
+                            if "PayerKey"  in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("path_payer_key")))
                 .withColumn("resolved_member_key",
-                    F.coalesce(F.col("memberKey").cast("long"),
-                               F.col("path_member_key")))
+                    F.coalesce(
+                        F.col("memberKey").cast("long")   # Type 2 camelCase
+                            if "memberKey" in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("MemberKey").cast("long")   # Type 1 PascalCase
+                            if "MemberKey" in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("path_member_key")))
                 .withColumn("resolved_claim_key",
-                    F.coalesce(F.col("claimKey").cast("long"),
-                               F.col("path_claim_key")))
+                    F.coalesce(
+                        F.col("claimKey").cast("long")    # Type 2 camelCase
+                            if "claimKey"  in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("ClaimKey").cast("long")    # Type 1 PascalCase
+                            if "ClaimKey"  in _json_df.columns else F.lit(None).cast("long"),
+                        F.col("path_claim_key")))
                 .withColumn("updated_at_epoch_ms",
                     F.coalesce(
-                        to_epoch_ms(F.col("updatedAt")),
+                        # Type 2 camelCase
+                        *([to_epoch_ms(F.col("updatedAt"))]
+                          if "updatedAt" in _json_df.columns else []),
+                        # Type 1 PascalCase
+                        *([to_epoch_ms(F.col("UpdatedAt"))]
+                          if "UpdatedAt" in _json_df.columns else []),
                         F.col("file_epoch_ms"),
                         F.lit(0).cast("long")
                     ))
                 .filter(F.col("resolved_claim_key").isNotNull())
                 # partition columns
+                # Coalesce both camelCase (Type 2) and PascalCase (Type 1)
                 .withColumn("claim_load_ts",
-                    normalize_ts(F.col("claimLoadDateTime")))
+                    F.coalesce(
+                        normalize_ts(F.col("claimLoadDateTime"))
+                            if "claimLoadDateTime" in _json_df.columns
+                            else F.lit(None).cast("timestamp"),
+                        normalize_ts(F.col("ClaimLoadDateTime"))
+                            if "ClaimLoadDateTime" in _json_df.columns
+                            else F.lit(None).cast("timestamp"),
+                    ))
                 .withColumn("loadyear",
                     F.coalesce(
                         F.year(F.col("claim_load_ts")).cast("int"),
@@ -1198,18 +2132,15 @@ try:
                     ))
             )
 
-            # coalesce (no shuffle) instead of repartition (full shuffle).
-            # With multiline JSON each task = 1 file already — coalescing
-            # groups small tasks into larger ones without moving data over
-            # the network. Only repartition if we need MORE partitions.
-            FILES_PER_PARTITION = FILES_PER_PART
-            ideal_partitions    = max(4, min(400,
-                -(-len(chunk_files) // FILES_PER_PARTITION)))
-            # If Spark created more partitions than ideal, coalesce (cheap).
-            # If Spark created fewer, repartition (adds parallelism).
-            raw_df = (raw_df.coalesce(ideal_partitions)
-                      if raw_df.rdd.getNumPartitions() > ideal_partitions
-                      else raw_df.repartition(ideal_partitions))
+            # Repartition to the pre-calculated ideal_partitions count.
+            # With multiline JSON Spark creates 1 task per input file by default.
+            # Grouping FILES_PER_PART files into one partition keeps task count
+            # sensible (target: 20-60 partitions per chunk at any scale tier).
+            #
+            # CRITICAL: do NOT call raw_df.rdd.getNumPartitions() here.
+            # That triggers a Spark planning action on the lazy DF BEFORE
+            # persist() — it was the cause of the 22-min per-chunk wait.
+            raw_df = raw_df.repartition(ideal_partitions)
 
             # Single persist + count — executes the whole lazy chain once.
             raw_df.persist(CACHE_LEVEL)
@@ -1221,12 +2152,29 @@ try:
 
             if chunk_count == 0:
                 print(f"[CHUNK {chunk_idx+1}] Empty — skipping")
+                # Still save checkpoint so resume skips this chunk too
+                save_chunk_checkpoint(chunk_idx, 0, total_written, is_full_load)
                 continue
 
             # ── STEP 7 (per chunk) — BUILD CLAIMS DF ──────────────────────
             def safe_col(col_name, cast_type="string"):
-                if col_name in raw_df.columns:
-                    return F.col(col_name).cast(cast_type)
+                """
+                Read a field from raw_df that may be camelCase (Type 2) or
+                PascalCase (Type 1).  Try the supplied name first, then its
+                opposite-case counterpart, then fall back to null.
+                """
+                cols = raw_df.columns
+                if col_name in cols:
+                    base = F.col(col_name).cast(cast_type)
+                    alt  = col_name[0].upper() + col_name[1:] if col_name[0].islower() \
+                           else col_name[0].lower() + col_name[1:]
+                    if alt in cols and alt != col_name:
+                        return F.coalesce(base, F.col(alt).cast(cast_type))
+                    return base
+                alt = col_name[0].upper() + col_name[1:] if col_name[0].islower() \
+                      else col_name[0].lower() + col_name[1:]
+                if alt in cols:
+                    return F.col(alt).cast(cast_type)
                 return F.lit(None).cast(cast_type)
 
             claims_df = raw_df.select(
@@ -1320,8 +2268,42 @@ try:
             )
 
             # ── STEP 8 (per chunk) — BUILD DIAGNOSIS DF ───────────────────
-            # Resolve the diagnosis array column name at runtime.
-            # Known variants across payers/feeds — checked in priority order.
+            # Two JSON casing variants exist in source data:
+            #   Type 1 (PascalCase): DiagnosisCode, ClaimKey, BatchRunSequence…
+            #   Type 2 (camelCase):  diagnosisCode, claimKey, batchRunSequence…
+            # Both casings are declared in the schema so Spark reads either.
+            # coalesce(Pascal, camel) in the select picks whichever is non-null.
+            # Explicit schema = no inferred top-level collisions.
+            _DX_ITEM_SCHEMA = ArrayType(StructType([
+                # camelCase (Type 2)
+                StructField("diagnosisCode",         StringType(),  True),
+                StructField("diagnosisOrder",         IntegerType(), True),
+                StructField("isPrimary",              StringType(),  True),
+                StructField("isSensitive",            IntegerType(), True),
+                StructField("isTrauma",               IntegerType(), True),
+                StructField("versionIndicator",       IntegerType(), True),
+                StructField("clientDataFeedCode",     StringType(),  True),
+                StructField("inboundBatchMasterKey",  LongType(),    True),
+                StructField("batchRunSequence",       IntegerType(), True),
+                StructField("claimDiagnosisKey",      LongType(),    True),
+                # item-level timestamps (camelCase — Type 2)
+                StructField("updatedAt",              StringType(),  True),
+                StructField("createdAt",              StringType(),  True),
+                # PascalCase (Type 1)
+                StructField("DiagnosisCode",         StringType(),  True),
+                StructField("DiagnosisOrder",         IntegerType(), True),
+                StructField("IsPrimary",              StringType(),  True),
+                StructField("IsSensitive",            IntegerType(), True),
+                StructField("IsTrauma",               IntegerType(), True),
+                StructField("VersionIndicator",       IntegerType(), True),
+                StructField("ClientDataFeedCode",     StringType(),  True),
+                StructField("InboundBatchMasterKey",  LongType(),    True),
+                StructField("BatchRunSequence",       IntegerType(), True),
+                StructField("ClaimDiagnosisKey",      LongType(),    True),
+                # item-level timestamps (PascalCase — Type 1)
+                StructField("UpdatedAt",              StringType(),  True),
+                StructField("CreatedAt",              StringType(),  True),
+            ]))
             _dx_col_candidates = [
                 "claimDiagnosisList", "ClaimDiagnosisList",
                 "diagnosisList",      "DiagnosisList",
@@ -1330,73 +2312,254 @@ try:
             _dx_col = next(
                 (c for c in _dx_col_candidates if c in raw_df.columns), None
             )
-            # If none found — produce empty array so downstream schema is stable
-            _dx_array_expr = (
-                F.when(F.col(_dx_col).isNotNull(), F.col(_dx_col))
-                 .otherwise(F.array())
-                if _dx_col
-                else F.array().cast("array<struct<>>")
-            )
             if not _dx_col:
-                print(f"[WARN] STEP 8: no diagnosis list column found in data "
-                      f"(tried {_dx_col_candidates}) — claimdiagnosis will be empty "
-                      f"for this chunk. Available cols: {raw_df.columns}")
+                print(f"[WARN] STEP 8: no diagnosis list column found "
+                      f"(tried {_dx_col_candidates}). Available: {raw_df.columns}")
+            _dx_col_name = _dx_col or "claimDiagnosisList"
 
-            diagnosis_df = raw_df.select(
-                F.col("resolved_payer_key").alias("payerkey"),
-                F.col("resolved_member_key").alias("memberkey"),
-                F.col("resolved_claim_key").alias("claimkey"),
-                F.col("loadyear"),
-                F.col("loadmonth"),
-                F.col("updated_at_epoch_ms").alias("claim_updated_at_epoch_ms"),
-                F.explode_outer(_dx_array_expr).alias("dx")
-            ).filter(F.col("dx").isNotNull()).select(
-                "payerkey", "memberkey", "claimkey", "loadyear", "loadmonth",
-                "claim_updated_at_epoch_ms",
-                # Use .getField() — returns null safely when struct field absent
-                F.coalesce(F.col("dx").getField("diagnosisCode"),
-                           F.col("dx").getField("DiagnosisCode"),
-                           F.lit(None).cast("string")).alias("diagnosiscode"),
-                F.coalesce(F.col("dx").getField("diagnosisOrder"),
-                           F.col("dx").getField("DiagnosisOrder"),
-                           F.lit(None).cast("int")).cast("int").alias("diagnosisorder"),
-                F.coalesce(F.col("dx").getField("isPrimary"),
-                           F.col("dx").getField("IsPrimary"),
-                           F.lit(None).cast("string")).alias("isprimary"),
-                F.coalesce(F.col("dx").getField("isSensitive"),
-                           F.col("dx").getField("IsSensitive"),
-                           F.lit(None).cast("int")).cast("int").alias("issensitive"),
-                F.coalesce(F.col("dx").getField("isTrauma"),
-                           F.col("dx").getField("IsTrauma"),
-                           F.lit(None).cast("int")).cast("int").alias("istrauma"),
-                F.coalesce(F.col("dx").getField("versionIndicator"),
-                           F.col("dx").getField("VersionIndicator"),
-                           F.lit(None).cast("int")).cast("int").alias("versionindicator"),
-                F.coalesce(F.col("dx").getField("clientDataFeedCode"),
-                           F.col("dx").getField("ClientDataFeedCode"),
-                           F.lit(None).cast("string")).alias("clientdatafeedcode"),
-                F.coalesce(F.col("dx").getField("inboundBatchMasterKey"),
-                           F.col("dx").getField("InboundBatchMasterKey"),
-                           F.lit(None).cast("long")).cast("long").alias("inboundbatchmasterkey"),
-                F.coalesce(F.col("dx").getField("batchRunSequence"),
-                           F.col("dx").getField("BatchRunSequence"),
-                           F.lit(None).cast("int")).cast("int").alias("batchrunsequence"),
-                F.coalesce(F.col("dx").getField("claimDiagnosisKey"),
-                           F.col("dx").getField("ClaimDiagnosisKey"),
-                           F.lit(None).cast("long")).cast("long").alias("claimdiagnosiskey"),
-                F.lit(None).cast("timestamp").alias("updatedat"),
+            # Both updatedAt and UpdatedAt declared — with caseSensitive=true
+            # each maps to its respective JSON field:
+            #   Type 2 JSON "updatedAt"  → updatedAt  schema field
+            #   Type 1 JSON "UpdatedAt"  → UpdatedAt  schema field
+            # Both camelCase and PascalCase array column names are included so
+            # a SINGLE spark.read handles both JSON types without two passes.
+            # _dx_alt_col: pick the opposite casing of _dx_col_name so the two
+            # schema fields are always distinct (prevents duplicate-column errors).
+            _dx_alt_col = (
+                _dx_col_name[0].upper() + _dx_col_name[1:]
+                if _dx_col_name[0].islower()
+                else _dx_col_name[0].lower() + _dx_col_name[1:]
+            )
+            _DX_READ_SCHEMA = StructType([
+                # camelCase top-level keys (Type 2)
+                StructField("payerKey",       LongType(),      True),
+                StructField("memberKey",      LongType(),      True),
+                StructField("claimKey",       LongType(),      True),
+                # PascalCase top-level keys (Type 1)
+                StructField("PayerKey",       LongType(),      True),
+                StructField("MemberKey",      LongType(),      True),
+                StructField("ClaimKey",       LongType(),      True),
+                # timestamp variants
+                StructField("updatedAt",      StringType(),    True),
+                StructField("UpdatedAt",      StringType(),    True),
+                # array column — primary candidate name
+                StructField(_dx_col_name,     _DX_ITEM_SCHEMA, True),
+                # array column — alternate candidate name (other casing)
+                StructField(_dx_alt_col,      _DX_ITEM_SCHEMA, True),
+            ])
+            _dx_raw = (
+                # ── SINGLE_READ_CACHE optimization ────────────────────────
+                # When enabled: derive diagnosis rows from the ALREADY CACHED
+                # raw_df instead of doing a 2nd spark.read.json() on chunk_files.
+                # This eliminates one full S3 re-read of all chunk files.
+                # raw_df already has all top-level fields including the array
+                # columns. We just select the relevant array column and explode.
+                #
+                # When disabled: keep the original separate spark.read.json()
+                # with the explicit schema (safe fallback for all other tiers).
+                raw_df.select(
+                    F.coalesce(
+                        F.col("payerKey").cast("long")  if "payerKey"  in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("PayerKey").cast("long")  if "PayerKey"  in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("resolved_payer_key")
+                    ).alias("_dxp"),
+                    F.coalesce(
+                        F.col("memberKey").cast("long") if "memberKey" in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("MemberKey").cast("long") if "MemberKey" in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("resolved_member_key")
+                    ).alias("_dxm"),
+                    F.col("resolved_claim_key").alias("_dxc"),
+                    F.col("loadyear").alias("_dx_yr"),
+                    F.col("loadmonth").alias("_dx_mo"),
+                    F.coalesce(
+                        F.col("updatedAt").cast("string") if "updatedAt" in raw_df.columns else F.lit(None).cast("string"),
+                        F.col("UpdatedAt").cast("string") if "UpdatedAt" in raw_df.columns else F.lit(None).cast("string"),
+                    ).alias("_upd"),
+                    F.coalesce(
+                        F.col(_dx_col_name) if _dx_col_name in raw_df.columns else F.lit(None),
+                        F.col(_dx_alt_col)  if _dx_alt_col  in raw_df.columns else F.lit(None),
+                    ).alias("_dx_arr"),
+                )
+                .withColumn("_dxepoch", to_epoch_ms(F.col("_upd")))
+                .withColumn("_dxrow", F.explode_outer(F.col("_dx_arr")))
+                .drop("_dx_arr", "_upd")
+                .filter(F.col("_dxrow").isNotNull())
+            ) if SINGLE_READ_CACHE else (
+                spark.read
+                .option("multiline", "true")
+                .option("mode",      "PERMISSIVE")
+                .schema(_DX_READ_SCHEMA)
+                .json(chunk_files)
+                .withColumn("_dxp",
+                    F.coalesce(F.col("payerKey"),  F.col("PayerKey")))
+                .withColumn("_dxm",
+                    F.coalesce(F.col("memberKey"), F.col("MemberKey")))
+                .withColumn("_dxc",
+                    F.coalesce(F.col("claimKey"),  F.col("ClaimKey")))
+                .drop("payerKey", "PayerKey", "memberKey", "MemberKey",
+                      "claimKey", "ClaimKey")
+                .withColumn("_dxepoch",
+                    F.coalesce(
+                        to_epoch_ms(F.col("updatedAt")),
+                        to_epoch_ms(F.col("UpdatedAt")),
+                        F.lit(0).cast("long")))
+                .drop("updatedAt", "UpdatedAt")
+                .withColumn("_dx_arr",
+                    F.coalesce(F.col(_dx_col_name), F.col(_dx_alt_col)))
+                .drop(_dx_col_name, _dx_alt_col)
+                .withColumn("_dxrow", F.explode_outer(F.col("_dx_arr")))
+                .drop("_dx_arr")
+                .filter(F.col("_dxrow").isNotNull())
+            )
+            if not SINGLE_READ_CACHE:
+                _dx_part = raw_df.select(
+                    F.col("resolved_claim_key").alias("_dxc_j"),
+                    F.col("loadyear").alias("_dx_yr"),
+                    F.col("loadmonth").alias("_dx_mo"),
+                ).distinct()
+                _dx_raw = _dx_raw.join(
+                    F.broadcast(_dx_part),
+                    F.col("_dxc") == F.col("_dxc_j"), "left"
+                ).drop("_dxc_j")
+
+            def _dx(camel, pascal, cast):
+                """coalesce camelCase and PascalCase struct field, then cast."""
+                return F.coalesce(
+                    F.col(f"_dxrow.{camel}").cast(cast),
+                    F.col(f"_dxrow.{pascal}").cast(cast),
+                )
+
+            diagnosis_df = _dx_raw.select(
+                F.col("_dxp").alias("payerkey"),
+                F.col("_dxm").alias("memberkey"),
+                F.col("_dxc").alias("claimkey"),
+                F.col("_dx_yr").alias("loadyear"),
+                F.col("_dx_mo").alias("loadmonth"),
+                _dx("diagnosisCode",        "DiagnosisCode",        "string") .alias("diagnosiscode"),
+                _dx("diagnosisOrder",       "DiagnosisOrder",       "int")    .alias("diagnosisorder"),
+                _dx("isPrimary",            "IsPrimary",            "string") .alias("isprimary"),
+                _dx("isSensitive",          "IsSensitive",          "int")    .alias("issensitive"),
+                _dx("isTrauma",             "IsTrauma",             "int")    .alias("istrauma"),
+                _dx("versionIndicator",     "VersionIndicator",     "int")    .alias("versionindicator"),
+                _dx("clientDataFeedCode",   "ClientDataFeedCode",   "string") .alias("clientdatafeedcode"),
+                _dx("inboundBatchMasterKey","InboundBatchMasterKey","long")   .alias("inboundbatchmasterkey"),
+                _dx("batchRunSequence",     "BatchRunSequence",     "int")    .alias("batchrunsequence"),
+                _dx("claimDiagnosisKey",    "ClaimDiagnosisKey",    "long")   .alias("claimdiagnosiskey"),
+                # updatedAt: coalesce item-level camel (Type 2) then Pascal (Type 1)
+                normalize_ts(F.coalesce(
+                    F.col("_dxrow.updatedAt").cast("string"),
+                    F.col("_dxrow.UpdatedAt").cast("string")))                         .alias("updatedat"),
                 F.coalesce(
-                    F.col("claim_updated_at_epoch_ms"),
-                    F.lit(0).cast("long")
-                ).alias("updatedatepochms"),
+                    to_epoch_ms(F.col("_dxrow.updatedAt").cast("string")),
+                    to_epoch_ms(F.col("_dxrow.UpdatedAt").cast("string")),
+                    F.col("_dxepoch"),
+                    F.lit(0).cast("long"))                                             .alias("updatedatepochms"),
             ) \
             .sortWithinPartitions(F.col("updatedatepochms").desc_nulls_last()) \
             .dropDuplicates(["payerkey", "loadyear", "loadmonth",
-                             "memberkey", "claimkey", "diagnosisorder"]) \
-            .drop("claim_updated_at_epoch_ms")
+                             "memberkey", "claimkey", "diagnosisorder"])
 
             # ── STEP 9 (per chunk) — BUILD LINES DF ───────────────────────
-            # Resolve the claim lines array column name at runtime.
+            # Same dual-casing pattern as diagnosis:
+            #   Type 1 (PascalCase): ClaimLineKey, BilledAmount, UpdatedAt…
+            #   Type 2 (camelCase):  claimLineKey, billedAmount, updatedAt…
+            _LN_ITEM_SCHEMA = ArrayType(StructType([
+                # camelCase (Type 2)
+                StructField("claimLineKey",             LongType(),    True),
+                StructField("claimLineNumber",          StringType(),  True),
+                StructField("procedureCode",            StringType(),  True),
+                StructField("procedureCodeType",        StringType(),  True),
+                StructField("billedAmount",             StringType(),  True),
+                StructField("clientPaidAmount",         StringType(),  True),
+                StructField("memberPaid",               StringType(),  True),
+                StructField("allowedAmount",            StringType(),  True),
+                StructField("coveredAmount",            StringType(),  True),
+                StructField("discountAmount",           StringType(),  True),
+                StructField("discountReason",           StringType(),  True),
+                StructField("excludedAmount",           StringType(),  True),
+                StructField("excludedReason",           StringType(),  True),
+                StructField("withholdAmount",           StringType(),  True),
+                StructField("withholdReason",           StringType(),  True),
+                StructField("providerPaidAmount",       StringType(),  True),
+                StructField("originalClientPaidAmount", StringType(),  True),
+                StructField("previousPaidAmount",       StringType(),  True),
+                StructField("dateofServiceFrom",        StringType(),  True),
+                StructField("dateofServiceThru",        StringType(),  True),
+                StructField("modifierCode01",           StringType(),  True),
+                StructField("modifierCode02",           StringType(),  True),
+                StructField("placeofService",           StringType(),  True),
+                StructField("revenueCode",              StringType(),  True),
+                StructField("serviceType",              StringType(),  True),
+                StructField("quantity",                 StringType(),  True),
+                StructField("houseCode",                StringType(),  True),
+                StructField("houseCodeDescription",     StringType(),  True),
+                StructField("paymentType",              StringType(),  True),
+                StructField("paymentTypeID",            StringType(),  True),
+                StructField("paymentComments",          StringType(),  True),
+                StructField("checkNumber",              StringType(),  True),
+                StructField("transactionCode",          StringType(),  True),
+                StructField("transactionDescription",   StringType(),  True),
+                StructField("adjustmentFlag",           StringType(),  True),
+                StructField("isPrimaryNDC",             StringType(),  True),
+                StructField("insuredTermDate",          StringType(),  True),
+                StructField("manipulationReason",       StringType(),  True),
+                StructField("claimDetailStatus",        StringType(),  True),
+                StructField("clientDataFeedCode",       StringType(),  True),
+                StructField("inboundBatchMasterKey",    LongType(),    True),
+                StructField("batchRunSequence",         IntegerType(), True),
+                StructField("stageClaimLineKey",        LongType(),    True),
+                StructField("updatedAt",                StringType(),  True),
+                StructField("createdAt",                StringType(),  True),
+                # PascalCase (Type 1) — all fields except updatedAt/createdAt
+                # which are already handled by case-insensitive JSON mapping
+                StructField("ClaimLineKey",             LongType(),    True),
+                StructField("ClaimLineNumber",          StringType(),  True),
+                StructField("ProcedureCode",            StringType(),  True),
+                StructField("ProcedureCodeType",        StringType(),  True),
+                StructField("BilledAmount",             StringType(),  True),
+                StructField("ClientPaidAmount",         StringType(),  True),
+                StructField("MemberPaid",               StringType(),  True),
+                StructField("AllowedAmount",            StringType(),  True),
+                StructField("CoveredAmount",            StringType(),  True),
+                StructField("DiscountAmount",           StringType(),  True),
+                StructField("DiscountReason",           StringType(),  True),
+                StructField("ExcludedAmount",           StringType(),  True),
+                StructField("ExcludedReason",           StringType(),  True),
+                StructField("WithholdAmount",           StringType(),  True),
+                StructField("WithholdReason",           StringType(),  True),
+                StructField("ProviderPaidAmount",       StringType(),  True),
+                StructField("OriginalClientPaidAmount", StringType(),  True),
+                StructField("PreviousPaidAmount",       StringType(),  True),
+                StructField("DateofServiceFrom",        StringType(),  True),
+                StructField("DateofServiceThru",        StringType(),  True),
+                StructField("ModifierCode01",           StringType(),  True),
+                StructField("ModifierCode02",           StringType(),  True),
+                StructField("PlaceofService",           StringType(),  True),
+                StructField("RevenueCode",              StringType(),  True),
+                StructField("ServiceType",              StringType(),  True),
+                StructField("Quantity",                 StringType(),  True),
+                StructField("HouseCode",                StringType(),  True),
+                StructField("HouseCodeDescription",     StringType(),  True),
+                StructField("PaymentType",              StringType(),  True),
+                StructField("PaymentTypeID",            StringType(),  True),
+                StructField("PaymentComments",          StringType(),  True),
+                StructField("CheckNumber",              StringType(),  True),
+                StructField("TransactionCode",          StringType(),  True),
+                StructField("TransactionDescription",   StringType(),  True),
+                StructField("AdjustmentFlag",           StringType(),  True),
+                StructField("IsPrimaryNDC",             StringType(),  True),
+                StructField("InsuredTermDate",          StringType(),  True),
+                StructField("ManipulationReason",       StringType(),  True),
+                StructField("ClaimDetailStatus",        StringType(),  True),
+                StructField("ClientDataFeedCode",       StringType(),  True),
+                StructField("InboundBatchMasterKey",    LongType(),    True),
+                StructField("BatchRunSequence",         IntegerType(), True),
+                StructField("StageClaimLineKey",        LongType(),    True),
+                StructField("UpdatedAt",                StringType(),  True),
+                StructField("CreatedAt",                StringType(),  True),
+                # caseSensitive=true → UpdatedAt/CreatedAt are truly distinct
+                # from updatedAt/createdAt above
+            ]))
             _ln_col_candidates = [
                 "claimLinesList", "ClaimLinesList",
                 "claimLines",     "ClaimLines",
@@ -1405,179 +2568,183 @@ try:
             _ln_col = next(
                 (c for c in _ln_col_candidates if c in raw_df.columns), None
             )
-            _ln_array_expr = (
-                F.when(F.col(_ln_col).isNotNull(), F.col(_ln_col))
-                 .otherwise(F.array())
-                if _ln_col
-                else F.array().cast("array<struct<>>")
-            )
             if not _ln_col:
-                print(f"[WARN] STEP 9: no lines list column found in data "
-                      f"(tried {_ln_col_candidates}) — claimlines will be empty "
-                      f"for this chunk. Available cols: {raw_df.columns}")
+                print(f"[WARN] STEP 9: no lines list column found "
+                      f"(tried {_ln_col_candidates}). Available: {raw_df.columns}")
+            _ln_col_name = _ln_col or "claimLinesList"
 
-            lines_df = raw_df.select(
-                F.col("resolved_payer_key").alias("payerkey"),
-                F.col("resolved_member_key").alias("memberkey"),
-                F.col("resolved_claim_key").alias("claimkey"),
-                F.col("loadyear"),
-                F.col("loadmonth"),
-                F.col("updated_at_epoch_ms").alias("claim_updated_at_epoch_ms"),
-                F.explode_outer(_ln_array_expr).alias("ln")
-            ).filter(F.col("ln").isNotNull()).select(
-                "payerkey", "memberkey", "claimkey", "loadyear", "loadmonth",
-                "claim_updated_at_epoch_ms",
-                # Use .getField() — returns null safely when struct field absent
-                F.coalesce(F.col("ln").getField("claimLineKey"),
-                           F.col("ln").getField("ClaimLineKey"),
-                           F.lit(None).cast("long")).cast("long").alias("claimlinekey"),
-                F.coalesce(F.col("ln").getField("claimLineNumber"),
-                           F.col("ln").getField("ClaimLineNumber"),
-                           F.lit(None).cast("string")).alias("claimlinenumber"),
-                F.coalesce(F.col("ln").getField("procedureCode"),
-                           F.col("ln").getField("ProcedureCode"),
-                           F.lit(None).cast("string")).alias("procedurecode"),
-                F.coalesce(F.col("ln").getField("procedureCodeType"),
-                           F.col("ln").getField("ProcedureCodeType"),
-                           F.lit(None).cast("string")).alias("procedurecodetype"),
-                F.coalesce(F.col("ln").getField("billedAmount"),
-                           F.col("ln").getField("BilledAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("billedamount"),
-                F.coalesce(F.col("ln").getField("clientPaidAmount"),
-                           F.col("ln").getField("ClientPaidAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("clientpaidamount"),
-                F.coalesce(F.col("ln").getField("memberPaid"),
-                           F.col("ln").getField("MemberPaid"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("memberpaid"),
-                F.coalesce(F.col("ln").getField("allowedAmount"),
-                           F.col("ln").getField("AllowedAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("allowedamount"),
-                F.coalesce(F.col("ln").getField("coveredAmount"),
-                           F.col("ln").getField("CoveredAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("coveredamount"),
-                F.coalesce(F.col("ln").getField("discountAmount"),
-                           F.col("ln").getField("DiscountAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("discountamount"),
-                F.coalesce(F.col("ln").getField("discountReason"),
-                           F.col("ln").getField("DiscountReason"),
-                           F.lit(None).cast("string")).alias("discountreason"),
-                F.coalesce(F.col("ln").getField("excludedAmount"),
-                           F.col("ln").getField("ExcludedAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("excludedamount"),
-                F.coalesce(F.col("ln").getField("excludedReason"),
-                           F.col("ln").getField("ExcludedReason"),
-                           F.lit(None).cast("string")).alias("excludedreason"),
-                F.coalesce(F.col("ln").getField("withholdAmount"),
-                           F.col("ln").getField("WithholdAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("withholdamount"),
-                F.coalesce(F.col("ln").getField("withholdReason"),
-                           F.col("ln").getField("WithholdReason"),
-                           F.lit(None).cast("string")).alias("withholdreason"),
-                F.coalesce(F.col("ln").getField("providerPaidAmount"),
-                           F.col("ln").getField("ProviderPaidAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("providerpaidamount"),
-                F.coalesce(F.col("ln").getField("originalClientPaidAmount"),
-                           F.col("ln").getField("OriginalClientPaidAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("originalclientpaidamount"),
-                F.coalesce(F.col("ln").getField("previousPaidAmount"),
-                           F.col("ln").getField("PreviousPaidAmount"),
-                           F.lit(None).cast("decimal(18,2)")).cast("decimal(18,2)").alias("previouspaidamount"),
-                normalize_date(F.coalesce(F.col("ln").getField("dateofServiceFrom"),
-                                          F.col("ln").getField("DateofServiceFrom"),
-                                          F.lit(None))).alias("dateofservicefrom"),
-                normalize_date(F.coalesce(F.col("ln").getField("dateofServiceThru"),
-                                          F.col("ln").getField("DateofServiceThru"),
-                                          F.lit(None))).alias("dateofservicethru"),
-                F.coalesce(F.col("ln").getField("modifierCode01"),
-                           F.col("ln").getField("ModifierCode01"),
-                           F.lit(None).cast("string")).alias("modifiercode01"),
-                F.coalesce(F.col("ln").getField("modifierCode02"),
-                           F.col("ln").getField("ModifierCode02"),
-                           F.lit(None).cast("string")).alias("modifiercode02"),
-                F.coalesce(F.col("ln").getField("placeofService"),
-                           F.col("ln").getField("PlaceofService"),
-                           F.lit(None).cast("string")).alias("placeofservice"),
-                F.coalesce(F.col("ln").getField("revenueCode"),
-                           F.col("ln").getField("RevenueCode"),
-                           F.lit(None).cast("string")).alias("revenuecode"),
-                F.coalesce(F.col("ln").getField("serviceType"),
-                           F.col("ln").getField("ServiceType"),
-                           F.lit(None).cast("string")).alias("servicetype"),
-                F.coalesce(F.col("ln").getField("quantity"),
-                           F.col("ln").getField("Quantity"),
-                           F.lit(None).cast("decimal(10,2)")).cast("decimal(10,2)").alias("quantity"),
-                F.coalesce(F.col("ln").getField("houseCode"),
-                           F.col("ln").getField("HouseCode"),
-                           F.lit(None).cast("string")).alias("housecode"),
-                F.coalesce(F.col("ln").getField("houseCodeDescription"),
-                           F.col("ln").getField("HouseCodeDescription"),
-                           F.lit(None).cast("string")).alias("housecodedescription"),
-                F.coalesce(F.col("ln").getField("paymentType"),
-                           F.col("ln").getField("PaymentType"),
-                           F.lit(None).cast("string")).alias("paymenttype"),
-                F.coalesce(F.col("ln").getField("paymentTypeID"),
-                           F.col("ln").getField("PaymentTypeID"),
-                           F.lit(None).cast("string")).alias("paymenttypeid"),
-                F.coalesce(F.col("ln").getField("paymentComments"),
-                           F.col("ln").getField("PaymentComments"),
-                           F.lit(None).cast("string")).alias("paymentcomments"),
-                F.coalesce(F.col("ln").getField("checkNumber"),
-                           F.col("ln").getField("CheckNumber"),
-                           F.lit(None).cast("string")).alias("checknumber"),
-                F.coalesce(F.col("ln").getField("transactionCode"),
-                           F.col("ln").getField("TransactionCode"),
-                           F.lit(None).cast("string")).alias("transactioncode"),
-                F.coalesce(F.col("ln").getField("transactionDescription"),
-                           F.col("ln").getField("TransactionDescription"),
-                           F.lit(None).cast("string")).alias("transactiondescription"),
-                F.coalesce(F.col("ln").getField("adjustmentFlag"),
-                           F.col("ln").getField("AdjustmentFlag"),
-                           F.lit(None).cast("string")).alias("adjustmentflag"),
-                F.coalesce(F.col("ln").getField("isPrimaryNDC"),
-                           F.col("ln").getField("IsPrimaryNDC"),
-                           F.lit(None).cast("string")).alias("isprimaryndc"),
-                F.coalesce(F.col("ln").getField("insuredTermDate"),
-                           F.col("ln").getField("InsuredTermDate"),
-                           F.lit(None).cast("string")).alias("insuredtermdate"),
-                F.coalesce(F.col("ln").getField("manipulationReason"),
-                           F.col("ln").getField("ManipulationReason"),
-                           F.lit(None).cast("string")).alias("manipulationreason"),
-                F.coalesce(F.col("ln").getField("claimDetailStatus"),
-                           F.col("ln").getField("ClaimDetailStatus"),
-                           F.lit(None).cast("string")).alias("claimdetailstatus"),
-                F.coalesce(F.col("ln").getField("clientDataFeedCode"),
-                           F.col("ln").getField("ClientDataFeedCode"),
-                           F.lit(None).cast("string")).alias("clientdatafeedcode"),
-                F.coalesce(F.col("ln").getField("inboundBatchMasterKey"),
-                           F.col("ln").getField("InboundBatchMasterKey"),
-                           F.lit(None).cast("long")).cast("long").alias("inboundbatchmasterkey"),
-                F.coalesce(F.col("ln").getField("batchRunSequence"),
-                           F.col("ln").getField("BatchRunSequence"),
-                           F.lit(None).cast("int")).cast("int").alias("batchrunsequence"),
-                F.coalesce(F.col("ln").getField("stageClaimLineKey"),
-                           F.col("ln").getField("StageClaimLineKey"),
-                           F.lit(None).cast("long")).cast("long").alias("stageclaimlinekey"),
+            # Both updatedAt and UpdatedAt declared — caseSensitive=true
+            # ensures they map to distinct JSON source fields per type.
+            # Both camelCase and PascalCase array column names included so a
+            # SINGLE spark.read handles both JSON types without two passes.
+            # _ln_alt_col: always pick the opposite casing of _ln_col_name.
+            _ln_alt_col = (
+                _ln_col_name[0].upper() + _ln_col_name[1:]
+                if _ln_col_name[0].islower()
+                else _ln_col_name[0].lower() + _ln_col_name[1:]
+            )
+            _LN_READ_SCHEMA = StructType([
+                # camelCase top-level keys (Type 2)
+                StructField("payerKey",    LongType(),      True),
+                StructField("memberKey",   LongType(),      True),
+                StructField("claimKey",    LongType(),      True),
+                # PascalCase top-level keys (Type 1)
+                StructField("PayerKey",    LongType(),      True),
+                StructField("MemberKey",   LongType(),      True),
+                StructField("ClaimKey",    LongType(),      True),
+                # timestamp variants
+                StructField("updatedAt",   StringType(),    True),
+                StructField("UpdatedAt",   StringType(),    True),
+                # array column — primary candidate name
+                StructField(_ln_col_name,  _LN_ITEM_SCHEMA, True),
+                # array column — alternate candidate name (other casing)
+                StructField(_ln_alt_col,   _LN_ITEM_SCHEMA, True),
+            ])
+            _ln_raw = (
+                # ── SINGLE_READ_CACHE optimization ────────────────────────
+                # Same approach as diagnosis above — derive lines rows from the
+                # already-cached raw_df, avoiding a 3rd full S3 re-read.
+                raw_df.select(
+                    F.coalesce(
+                        F.col("payerKey").cast("long")  if "payerKey"  in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("PayerKey").cast("long")  if "PayerKey"  in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("resolved_payer_key")
+                    ).alias("_lnp"),
+                    F.coalesce(
+                        F.col("memberKey").cast("long") if "memberKey" in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("MemberKey").cast("long") if "MemberKey" in raw_df.columns else F.lit(None).cast("long"),
+                        F.col("resolved_member_key")
+                    ).alias("_lnm"),
+                    F.col("resolved_claim_key").alias("_lnc"),
+                    F.col("loadyear").alias("_ln_yr"),
+                    F.col("loadmonth").alias("_ln_mo"),
+                    F.coalesce(
+                        F.col("updatedAt").cast("string") if "updatedAt" in raw_df.columns else F.lit(None).cast("string"),
+                        F.col("UpdatedAt").cast("string") if "UpdatedAt" in raw_df.columns else F.lit(None).cast("string"),
+                    ).alias("_upd"),
+                    F.coalesce(
+                        F.col(_ln_col_name) if _ln_col_name in raw_df.columns else F.lit(None),
+                        F.col(_ln_alt_col)  if _ln_alt_col  in raw_df.columns else F.lit(None),
+                    ).alias("_ln_arr"),
+                )
+                .withColumn("_lnepoch", to_epoch_ms(F.col("_upd")))
+                .withColumn("_lnrow", F.explode_outer(F.col("_ln_arr")))
+                .drop("_ln_arr", "_upd")
+                .filter(F.col("_lnrow").isNotNull())
+            ) if SINGLE_READ_CACHE else (
+                spark.read
+                .option("multiline", "true")
+                .option("mode",      "PERMISSIVE")
+                .schema(_LN_READ_SCHEMA)
+                .json(chunk_files)
+                .withColumn("_lnp",
+                    F.coalesce(F.col("payerKey"),  F.col("PayerKey")))
+                .withColumn("_lnm",
+                    F.coalesce(F.col("memberKey"), F.col("MemberKey")))
+                .withColumn("_lnc",
+                    F.coalesce(F.col("claimKey"),  F.col("ClaimKey")))
+                .drop("payerKey", "PayerKey", "memberKey", "MemberKey",
+                      "claimKey", "ClaimKey")
+                .withColumn("_lnepoch",
+                    F.coalesce(
+                        to_epoch_ms(F.col("updatedAt")),
+                        to_epoch_ms(F.col("UpdatedAt")),
+                        F.lit(0).cast("long")))
+                .drop("updatedAt", "UpdatedAt")
+                .withColumn("_ln_arr",
+                    F.coalesce(F.col(_ln_col_name), F.col(_ln_alt_col)))
+                .drop(_ln_col_name, _ln_alt_col)
+                .withColumn("_lnrow", F.explode_outer(F.col("_ln_arr")))
+                .drop("_ln_arr")
+                .filter(F.col("_lnrow").isNotNull())
+            )
+            if not SINGLE_READ_CACHE:
+                _ln_part = raw_df.select(
+                    F.col("resolved_claim_key").alias("_lnc_j"),
+                    F.col("loadyear").alias("_ln_yr"),
+                    F.col("loadmonth").alias("_ln_mo"),
+                ).distinct()
+                _ln_raw = _ln_raw.join(
+                    F.broadcast(_ln_part),
+                    F.col("_lnc") == F.col("_lnc_j"), "left"
+                ).drop("_lnc_j")
+
+            def _ln(camel, pascal, cast):
+                """coalesce camelCase and PascalCase struct field, then cast."""
+                return F.coalesce(
+                    F.col(f"_lnrow.{camel}").cast(cast),
+                    F.col(f"_lnrow.{pascal}").cast(cast),
+                )
+
+            lines_df = _ln_raw.select(
+                F.col("_lnp").alias("payerkey"),
+                F.col("_lnm").alias("memberkey"),
+                F.col("_lnc").alias("claimkey"),
+                F.col("_ln_yr").alias("loadyear"),
+                F.col("_ln_mo").alias("loadmonth"),
+                _ln("claimLineKey",             "ClaimLineKey",             "long")          .alias("claimlinekey"),
+                _ln("claimLineNumber",          "ClaimLineNumber",          "string")        .alias("claimlinenumber"),
+                _ln("procedureCode",            "ProcedureCode",            "string")        .alias("procedurecode"),
+                _ln("procedureCodeType",        "ProcedureCodeType",        "string")        .alias("procedurecodetype"),
+                _ln("billedAmount",             "BilledAmount",             "decimal(18,2)") .alias("billedamount"),
+                _ln("clientPaidAmount",         "ClientPaidAmount",         "decimal(18,2)") .alias("clientpaidamount"),
+                _ln("memberPaid",               "MemberPaid",               "decimal(18,2)") .alias("memberpaid"),
+                _ln("allowedAmount",            "AllowedAmount",            "decimal(18,2)") .alias("allowedamount"),
+                _ln("coveredAmount",            "CoveredAmount",            "decimal(18,2)") .alias("coveredamount"),
+                _ln("discountAmount",           "DiscountAmount",           "decimal(18,2)") .alias("discountamount"),
+                _ln("discountReason",           "DiscountReason",           "string")        .alias("discountreason"),
+                _ln("excludedAmount",           "ExcludedAmount",           "decimal(18,2)") .alias("excludedamount"),
+                _ln("excludedReason",           "ExcludedReason",           "string")        .alias("excludedreason"),
+                _ln("withholdAmount",           "WithholdAmount",           "decimal(18,2)") .alias("withholdamount"),
+                _ln("withholdReason",           "WithholdReason",           "string")        .alias("withholdreason"),
+                _ln("providerPaidAmount",       "ProviderPaidAmount",       "decimal(18,2)") .alias("providerpaidamount"),
+                _ln("originalClientPaidAmount", "OriginalClientPaidAmount", "decimal(18,2)") .alias("originalclientpaidamount"),
+                _ln("previousPaidAmount",       "PreviousPaidAmount",       "decimal(18,2)") .alias("previouspaidamount"),
+                normalize_date(F.coalesce(
+                    F.col("_lnrow.dateofServiceFrom").cast("string"),
+                    F.col("_lnrow.DateofServiceFrom").cast("string")))                       .alias("dateofservicefrom"),
+                normalize_date(F.coalesce(
+                    F.col("_lnrow.dateofServiceThru").cast("string"),
+                    F.col("_lnrow.DateofServiceThru").cast("string")))                       .alias("dateofservicethru"),
+                _ln("modifierCode01",           "ModifierCode01",           "string")        .alias("modifiercode01"),
+                _ln("modifierCode02",           "ModifierCode02",           "string")        .alias("modifiercode02"),
+                _ln("placeofService",           "PlaceofService",           "string")        .alias("placeofservice"),
+                _ln("revenueCode",              "RevenueCode",              "string")        .alias("revenuecode"),
+                _ln("serviceType",              "ServiceType",              "string")        .alias("servicetype"),
+                _ln("quantity",                 "Quantity",                 "decimal(10,2)") .alias("quantity"),
+                _ln("houseCode",                "HouseCode",                "string")        .alias("housecode"),
+                _ln("houseCodeDescription",     "HouseCodeDescription",     "string")        .alias("housecodedescription"),
+                _ln("paymentType",              "PaymentType",              "string")        .alias("paymenttype"),
+                _ln("paymentTypeID",            "PaymentTypeID",            "string")        .alias("paymenttypeid"),
+                _ln("paymentComments",          "PaymentComments",          "string")        .alias("paymentcomments"),
+                _ln("checkNumber",              "CheckNumber",              "string")        .alias("checknumber"),
+                _ln("transactionCode",          "TransactionCode",          "string")        .alias("transactioncode"),
+                _ln("transactionDescription",   "TransactionDescription",   "string")        .alias("transactiondescription"),
+                _ln("adjustmentFlag",           "AdjustmentFlag",           "string")        .alias("adjustmentflag"),
+                _ln("isPrimaryNDC",             "IsPrimaryNDC",             "string")        .alias("isprimaryndc"),
+                _ln("insuredTermDate",          "InsuredTermDate",          "string")        .alias("insuredtermdate"),
+                _ln("manipulationReason",       "ManipulationReason",       "string")        .alias("manipulationreason"),
+                _ln("claimDetailStatus",        "ClaimDetailStatus",        "string")        .alias("claimdetailstatus"),
+                _ln("clientDataFeedCode",       "ClientDataFeedCode",       "string")        .alias("clientdatafeedcode"),
+                _ln("inboundBatchMasterKey",    "InboundBatchMasterKey",    "long")          .alias("inboundbatchmasterkey"),
+                _ln("batchRunSequence",         "BatchRunSequence",         "int")           .alias("batchrunsequence"),
+                _ln("stageClaimLineKey",        "StageClaimLineKey",        "long")          .alias("stageclaimlinekey"),
                 normalize_ts(F.coalesce(
-                    F.col("ln").getField("updatedAt"),
-                    F.col("ln").getField("UpdatedAt"),
-                    F.lit(None)
-                )).alias("updatedat"),
+                    F.col("_lnrow.updatedAt").cast("string"),
+                    F.col("_lnrow.UpdatedAt").cast("string")))                               .alias("updatedat"),
                 normalize_ts(F.coalesce(
-                    F.col("ln").getField("createdAt"),
-                    F.col("ln").getField("CreatedAt"),
-                    F.lit(None)
-                )).alias("createdat"),
+                    F.col("_lnrow.createdAt").cast("string"),
+                    F.col("_lnrow.CreatedAt").cast("string")))                               .alias("createdat"),
                 F.coalesce(
-                    to_epoch_ms(F.col("ln").getField("updatedAt")),
-                    to_epoch_ms(F.col("ln").getField("UpdatedAt")),
-                    F.col("claim_updated_at_epoch_ms"),
+                    to_epoch_ms(F.col("_lnrow.updatedAt").cast("string")),
+                    to_epoch_ms(F.col("_lnrow.UpdatedAt").cast("string")),
+                    F.col("_lnepoch"),
                     F.lit(0).cast("long")
                 ).alias("updatedatepochms"),
             ) \
             .sortWithinPartitions(F.col("updatedatepochms").desc_nulls_last()) \
             .dropDuplicates(["payerkey", "loadyear", "loadmonth",
-                             "memberkey", "claimkey", "claimlinenumber"]) \
-            .drop("claim_updated_at_epoch_ms")
+                             "memberkey", "claimkey", "claimlinenumber"])
 
             # ── STEP 10 (per chunk) — WRITE ────────────────────────────────
             # Collect distinct partitions this chunk touches (tiny — driver-side)
@@ -1662,137 +2829,156 @@ try:
 
                 return unscoped.unionByName(scoped_alive)
 
-            # ── CLAIMS ────────────────────────────────────────────────────
-            if is_full_load:
-                _safe_write(claims_df,
-                            f"glue_catalog.{DATABASE}.claims", "claims")
-            else:
-                claims_tbl      = f"glue_catalog.{DATABASE}.claims"
-                existing_claims = _partition_filter(claims_tbl, affected_partitions,
-                                                    is_table=True)
+            # ── CLAIMS / DIAGNOSIS / LINES WRITE ─────────────────────────
+            # OPTIMIZATION: PARALLEL_TABLE_WRITES
+            # When enabled (payer326 tier): all 3 table writes run simultaneously
+            # using ThreadPoolExecutor(3). Each write is independent — they touch
+            # different Iceberg tables. This cuts write time from ~15 min (seq)
+            # to ~5 min (parallel) per chunk.
+            #
+            # When disabled (other tiers): sequential write preserved exactly
+            # as before — no risk to existing payers.
 
-                # Strip rows for re-added members (claim re-assignment m1→m2)
-                if readded_members:
-                    ra_df = spark.createDataFrame(
-                        [(int(PAYER_KEY), int(m)) for m in readded_members
-                         if m.isdigit()],
-                        ["payerkey_ra", "memberkey_ra"]
-                    )
-                    existing_claims = existing_claims.join(
-                        F.broadcast(ra_df),
-                        on=(
-                            (F.col("payerkey")  == F.col("payerkey_ra")) &
-                            (F.col("memberkey") == F.col("memberkey_ra"))
-                        ),
-                        how="left_anti"
-                    )
-                    print(f"[CHUNK {chunk_idx+1}] Re-added member rows stripped "
-                          f"from claims: {readded_members}")
-
-                # Strip rows whose claim files were partially deleted from S3
-                existing_claims = _strip_deleted_claims(
-                    existing_claims, partial_chunk_members
-                )
-
-                replaced_claims = F.broadcast(
-                    claims_df.select("payerkey", "loadyear", "loadmonth",
-                                     "memberkey", "claimkey").distinct()
-                )
-                merged_claims = (
-                    existing_claims
-                    .join(replaced_claims,
-                          on=["payerkey", "loadyear", "loadmonth",
-                              "memberkey", "claimkey"],
-                          how="left_anti")
-                    .unionByName(claims_df)
-                )
-                _safe_write(merged_claims, claims_tbl, "claims")
+            def _write_claims():
+                if is_full_load:
+                    _iceberg_append(claims_df,
+                                    f"glue_catalog.{DATABASE}.claims", "claims")
+                else:
+                    claims_tbl      = f"glue_catalog.{DATABASE}.claims"
+                    existing_claims = _partition_filter(claims_tbl, affected_partitions,
+                                                        is_table=True)
+                    if readded_members:
+                        ra_df = spark.createDataFrame(
+                            [(int(PAYER_KEY), int(m)) for m in readded_members
+                             if m.isdigit()],
+                            ["payerkey_ra", "memberkey_ra"]
+                        )
+                        existing_claims = existing_claims.join(
+                            F.broadcast(ra_df),
+                            on=((F.col("payerkey")  == F.col("payerkey_ra")) &
+                                (F.col("memberkey") == F.col("memberkey_ra"))),
+                            how="left_anti"
+                        )
+                        print(f"[CHUNK {chunk_idx+1}] Re-added member rows stripped "
+                              f"from claims: {readded_members}")
+                    existing_claims = _strip_deleted_claims(
+                        existing_claims, partial_chunk_members)
+                    replaced_claims = F.broadcast(
+                        claims_df.select("payerkey", "loadyear", "loadmonth",
+                                         "memberkey", "claimkey").distinct())
+                    merged_claims = (existing_claims
+                        .join(replaced_claims,
+                              on=["payerkey", "loadyear", "loadmonth",
+                                  "memberkey", "claimkey"], how="left_anti")
+                        .unionByName(claims_df))
+                    _safe_write(merged_claims, claims_tbl, "claims")
                 print(f"[CHUNK {chunk_idx+1}] claims write ✅")
 
-            # ── CLAIM DIAGNOSIS ───────────────────────────────────────────
-            if is_full_load:
-                _safe_write(diagnosis_df,
-                            f"glue_catalog.{DATABASE}.claimdiagnosis",
-                            "claimdiagnosis")
-            else:
-                dx_tbl      = f"glue_catalog.{DATABASE}.claimdiagnosis"
-                existing_dx = _partition_filter(dx_tbl, affected_partitions,
-                                                is_table=True)
-                if readded_members:
-                    ra_df_dx = spark.createDataFrame(
-                        [(int(PAYER_KEY), int(m)) for m in readded_members
-                         if m.isdigit()],
-                        ["payerkey_ra", "memberkey_ra"]
-                    )
-                    existing_dx = existing_dx.join(
-                        F.broadcast(ra_df_dx),
-                        on=(
-                            (F.col("payerkey")  == F.col("payerkey_ra")) &
-                            (F.col("memberkey") == F.col("memberkey_ra"))
-                        ),
-                        how="left_anti"
-                    )
-                existing_dx = _strip_deleted_claims(
-                    existing_dx, partial_chunk_members
-                )
-                replaced_dx = F.broadcast(
-                    diagnosis_df.select("payerkey", "loadyear", "loadmonth",
-                                        "memberkey", "claimkey").distinct()
-                )
-                merged_dx = (
-                    existing_dx
-                    .join(replaced_dx,
-                          on=["payerkey", "loadyear", "loadmonth",
-                              "memberkey", "claimkey"],
-                          how="left_anti")
-                    .unionByName(diagnosis_df)
-                )
-                _safe_write(merged_dx, dx_tbl, "claimdiagnosis")
+            def _write_diagnosis():
+                if is_full_load:
+                    _iceberg_append(diagnosis_df,
+                                    f"glue_catalog.{DATABASE}.claimdiagnosis",
+                                    "claimdiagnosis")
+                else:
+                    dx_tbl      = f"glue_catalog.{DATABASE}.claimdiagnosis"
+                    existing_dx = _partition_filter(dx_tbl, affected_partitions,
+                                                    is_table=True)
+                    if readded_members:
+                        ra_df_dx = spark.createDataFrame(
+                            [(int(PAYER_KEY), int(m)) for m in readded_members
+                             if m.isdigit()],
+                            ["payerkey_ra", "memberkey_ra"]
+                        )
+                        existing_dx = existing_dx.join(
+                            F.broadcast(ra_df_dx),
+                            on=((F.col("payerkey")  == F.col("payerkey_ra")) &
+                                (F.col("memberkey") == F.col("memberkey_ra"))),
+                            how="left_anti"
+                        )
+                    existing_dx = _strip_deleted_claims(
+                        existing_dx, partial_chunk_members)
+                    replaced_dx = F.broadcast(
+                        diagnosis_df.select("payerkey", "loadyear", "loadmonth",
+                                            "memberkey", "claimkey").distinct())
+                    merged_dx = (existing_dx
+                        .join(replaced_dx,
+                              on=["payerkey", "loadyear", "loadmonth",
+                                  "memberkey", "claimkey"], how="left_anti")
+                        .unionByName(diagnosis_df))
+                    _safe_write(merged_dx, dx_tbl, "claimdiagnosis")
                 print(f"[CHUNK {chunk_idx+1}] claimdiagnosis write ✅")
 
-            # ── CLAIM LINES ───────────────────────────────────────────────
-            if is_full_load:
-                _safe_write(lines_df,
-                            f"glue_catalog.{DATABASE}.claimlines", "claimlines")
-            else:
-                ln_tbl      = f"glue_catalog.{DATABASE}.claimlines"
-                existing_ln = _partition_filter(ln_tbl, affected_partitions,
-                                                is_table=True)
-                if readded_members:
-                    ra_df_ln = spark.createDataFrame(
-                        [(int(PAYER_KEY), int(m)) for m in readded_members
-                         if m.isdigit()],
-                        ["payerkey_ra", "memberkey_ra"]
-                    )
-                    existing_ln = existing_ln.join(
-                        F.broadcast(ra_df_ln),
-                        on=(
-                            (F.col("payerkey")  == F.col("payerkey_ra")) &
-                            (F.col("memberkey") == F.col("memberkey_ra"))
-                        ),
-                        how="left_anti"
-                    )
-                existing_ln = _strip_deleted_claims(
-                    existing_ln, partial_chunk_members
-                )
-                replaced_ln = F.broadcast(
-                    lines_df.select("payerkey", "loadyear", "loadmonth",
-                                    "memberkey", "claimkey").distinct()
-                )
-                merged_ln = (
-                    existing_ln
-                    .join(replaced_ln,
-                          on=["payerkey", "loadyear", "loadmonth",
-                              "memberkey", "claimkey"],
-                          how="left_anti")
-                    .unionByName(lines_df)
-                )
-                _safe_write(merged_ln, ln_tbl, "claimlines")
+            def _write_lines():
+                if is_full_load:
+                    _iceberg_append(lines_df,
+                                    f"glue_catalog.{DATABASE}.claimlines",
+                                    "claimlines")
+                else:
+                    ln_tbl      = f"glue_catalog.{DATABASE}.claimlines"
+                    existing_ln = _partition_filter(ln_tbl, affected_partitions,
+                                                    is_table=True)
+                    if readded_members:
+                        ra_df_ln = spark.createDataFrame(
+                            [(int(PAYER_KEY), int(m)) for m in readded_members
+                             if m.isdigit()],
+                            ["payerkey_ra", "memberkey_ra"]
+                        )
+                        existing_ln = existing_ln.join(
+                            F.broadcast(ra_df_ln),
+                            on=((F.col("payerkey")  == F.col("payerkey_ra")) &
+                                (F.col("memberkey") == F.col("memberkey_ra"))),
+                            how="left_anti"
+                        )
+                    existing_ln = _strip_deleted_claims(
+                        existing_ln, partial_chunk_members)
+                    replaced_ln = F.broadcast(
+                        lines_df.select("payerkey", "loadyear", "loadmonth",
+                                        "memberkey", "claimkey").distinct())
+                    merged_ln = (existing_ln
+                        .join(replaced_ln,
+                              on=["payerkey", "loadyear", "loadmonth",
+                                  "memberkey", "claimkey"], how="left_anti")
+                        .unionByName(lines_df))
+                    _safe_write(merged_ln, ln_tbl, "claimlines")
                 print(f"[CHUNK {chunk_idx+1}] claimlines write ✅")
+
+            if PARALLEL_TABLE_WRITES:
+                # ── PARALLEL WRITES (payer326 tier) ───────────────────────
+                # claims + claimdiagnosis + claimlines written simultaneously.
+                # Each write goes to a different Iceberg table → zero contention.
+                # ThreadPoolExecutor(3) on the driver — actual Spark work still
+                # distributed across all workers; only the submission is parallel.
+                print(f"[CHUNK {chunk_idx+1}] Writing 3 tables in PARALLEL...")
+                _write_errors = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as _wp:
+                    _futures = {
+                        _wp.submit(_write_claims):    "claims",
+                        _wp.submit(_write_diagnosis): "claimdiagnosis",
+                        _wp.submit(_write_lines):     "claimlines",
+                    }
+                    for _f in concurrent.futures.as_completed(_futures):
+                        _tbl_name = _futures[_f]
+                        try:
+                            _f.result()
+                        except Exception as _we:
+                            _write_errors.append(f"{_tbl_name}: {_we}")
+                if _write_errors:
+                    raise Exception(
+                        f"Parallel write failed for: {'; '.join(_write_errors)}"
+                    )
+                print(f"[CHUNK {chunk_idx+1}] All 3 parallel writes complete ✅")
+            else:
+                # ── SEQUENTIAL WRITES (all other tiers) ───────────────────
+                _write_claims()
+                _write_diagnosis()
+                _write_lines()
 
             total_written += chunk_count
             print(f"[CHUNK {chunk_idx+1}/{num_chunks}] Written ✅  "
                   f"(cumulative records: {total_written})")
+
+            save_chunk_checkpoint(chunk_idx, chunk_count, total_written,
+                                  is_full_load)
 
         except Exception as chunk_err:
             raise Exception(
@@ -1809,6 +2995,18 @@ try:
 
     print(f"\n[STEP 4–10] All {num_chunks} chunks processed ✅  "
           f"Total records written: {total_written}")
+
+    # ── Clean up checkpoint files after successful completion ──────────────
+    # Full load  : delete all full-load chunk checkpoints for this payer.
+    # Incremental: delete this run's chunk folder + the active-run epoch marker
+    #              so the next incremental run starts clean (new epoch, chunk 0).
+    delete_chunk_checkpoints(is_full_load)
+    if not is_full_load and _INCR_ACTIVE_RUN_KEY:
+        try:
+            s3_client.delete_object(Bucket=TARGET_BUCKET, Key=_INCR_ACTIVE_RUN_KEY)
+            print(f"[CHECKPOINT] Incremental active-run marker deleted ✅")
+        except Exception as _cd:
+            print(f"[CHECKPOINT] WARN — could not delete active-run marker: {_cd}")
 
     # ── Restore merge-on-read after full load ─────────────────────────────────
     # Full load switched tables to copy-on-write for efficient bulk writes.
@@ -1867,14 +3065,35 @@ finally:
     print(f"[FINALLY] Records merged   : {filtered_count}")
     print(f"[FINALLY] Members deleted  : {len(deleted_members)}")
 
-    save_watermark(
-        status                  = job_status,
-        files_processed         = len(changed_files),
-        records_merged          = filtered_count,
-        mode                    = "FULL LOAD" if is_full_load else "INCREMENTAL",
-        members_deleted         = len(deleted_members),
-        member_claimkey_counts  = current_member_claimkey_counts,
-    )
+    # ── Only write watermark on SUCCESS — never on FAILED ────────────────────
+    # If the job FAILED, do NOT overwrite the watermark with the current run's
+    # timestamp.  On re-run the watermark still points at the last SUCCESSFUL
+    # run epoch, so Spark re-scans and re-processes ALL files that changed
+    # since that successful run — including chunks already partially processed
+    # in the failed run.
+    #
+    # Writing a FAILED watermark with current_run_epoch_ms causes re-runs to
+    # skip every file processed before the failure, leaving the data warehouse
+    # in a permanently incomplete / corrupt state and making manual recovery
+    # necessary.
+    #
+    # Iceberg writes are idempotent (overwritePartitions + left_anti merge +
+    # dropDuplicates), so re-processing the same files on re-run is safe —
+    # no duplicate rows are introduced.
+    if job_status == "FAILED":
+        print("[WATERMARK] Job FAILED — watermark NOT updated.")
+        print("[WATERMARK] Re-run will reprocess all files since the last "
+              "successful run epoch to ensure the data warehouse is complete.")
+    else:
+        save_watermark(
+            status                  = job_status,
+            files_processed         = len(changed_files),
+            records_merged          = filtered_count,
+            mode                    = "FULL LOAD" if is_full_load else "INCREMENTAL",
+            members_deleted         = len(deleted_members),
+            member_claimkey_counts  = current_member_claimkey_counts,
+            member_claimkey_sets    = current_member_claimkey_sets,
+        )
 
     print("=" * 60)
     print(f"[DONE] Status          : {job_status}")
@@ -1888,5 +3107,3 @@ finally:
     print("=" * 60)
 
     job.commit()
-
-
