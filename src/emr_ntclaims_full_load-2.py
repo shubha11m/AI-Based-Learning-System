@@ -155,13 +155,21 @@ print(f"[ARGS] run_optimize  = {RUN_OPTIMIZE}")
 
 # ── EMR / Spark bootstrap ─────────────────────────────────────────────────────
 # Pure PySpark — no Glue runtime dependency.
-# KryoSerializer MUST be set via spark-submit --conf before SparkContext starts.
+# KyrioSerializer MUST be set via spark-submit --conf before SparkContext starts.
 # Setting it here after SparkSession is already running has NO effect and causes
 # cache corruption (StreamCorruptedException: invalid type code: 00).
-spark = SparkSession.builder \
-    .appName(f"NT-Claims-FullLoad-Payer-{_args.payer_key}") \
-    .getOrCreate()
-sc = spark.sparkContext
+try:
+    spark = SparkSession.builder \
+        .appName(f"NT-Claims-FullLoad-Payer-{_args.payer_key}") \
+        .getOrCreate()
+    sc = spark.sparkContext
+    print(f"[BOOTSTRAP] SparkSession created ✅  "
+          f"Spark version: {spark.version}  "
+          f"App ID: {sc.applicationId}")
+except Exception as _spark_init_err:
+    print(f"[BOOTSTRAP] FATAL — SparkSession creation failed: {_spark_init_err}")
+    import traceback; traceback.print_exc()
+    sys.exit(1)
 
 ENV       = _args.param1
 RUN       = _args.param2
@@ -453,7 +461,10 @@ print(f"[INFO] ─────────────────────�
 
 # ── Spark / Iceberg runtime config ────────────────────────────────────────────
 spark.conf.set("spark.sql.sources.partitionOverwriteMode",            "dynamic")
-spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+# Note: spark.sql.iceberg.handle-timestamp-without-timezone is NOT a valid
+# Spark/Iceberg config key.  UTC timezone handling is covered by
+# spark.sql.session.timeZone = UTC (set below) and
+# spark.sql.legacy.timeParserPolicy = CORRECTED (also set below).
 spark.conf.set("spark.sql.catalog.glue_catalog",
                "org.apache.iceberg.spark.SparkCatalog")
 spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl",
@@ -505,8 +516,15 @@ deleted_members                = set()
 reassigned_claims              = {}   # {src_member_key → set(claimkeys moved to another member)}
 current_member_claimkey_counts = {}   # {member_key → int}  saved to watermark
 current_member_claimkey_sets   = {}   # {member_key → [str]} saved to watermark for exact re-assignment detection next run
-s3_client                      = boto3.client("s3")
-glue_client          = boto3.client("glue")
+try:
+    s3_client   = boto3.client("s3")
+    glue_client = boto3.client("glue")
+    print("[BOOTSTRAP] boto3 S3 + Glue clients created ✅")
+except Exception as _boto_err:
+    print(f"[BOOTSTRAP] FATAL — boto3 client creation failed: {_boto_err}")
+    import traceback; traceback.print_exc()
+    spark.stop()
+    sys.exit(1)
 current_run_epoch_ms = int(datetime.utcnow().timestamp() * 1000)
 current_run_ts       = datetime.utcnow().isoformat()
 raw_df               = None
@@ -1196,11 +1214,19 @@ def _partition_filter(source, affected_partitions, is_table=False):
 try:
 
     # ── STEP 1 — CREATE DATABASE ──────────────────────────────────────────────
+    # MUST qualify with the catalog name so the database is created in the
+    # Glue Data Catalog (glue_catalog), NOT in the local Hive metastore.
+    # Without this, subsequent glue_catalog.{DATABASE}.claims references fail
+    # with "database not found in glue_catalog" causing an immediate status 1 exit.
     try:
-        spark.sql(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
-        print(f"[STEP 1] Database {DATABASE} ready ✅")
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS glue_catalog.{DATABASE}")
+        print(f"[STEP 1] Database glue_catalog.{DATABASE} ready ✅")
     except Exception as e:
-        print(f"[STEP 1] DB warning (may already exist): {e}")
+        err = str(e).lower()
+        if "already exists" in err:
+            print(f"[STEP 1] Database glue_catalog.{DATABASE} already exists ✅")
+        else:
+            print(f"[STEP 1] DB warning (may already exist): {e}")
 
     # ── STEP 2 — READ WATERMARK ───────────────────────────────────────────────
     print("[STEP 2] Reading watermark...")
